@@ -92,11 +92,15 @@ class Llava_OneVision_LLaDA(lmms):
         batch_size_ppl: Optional[int] = 32,
         is_check_greedy: Optional[bool] = True,
         use_fast_dllm: Optional[bool] = False,
+        load_4bit: Optional[bool] = False,
+        load_8bit: Optional[bool] = False,
         **kwargs,
     ) -> None:
         super().__init__()
         # Do not use kwargs for now
         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+        self.load_4bit = load_4bit
+        self.load_8bit = load_8bit
 
         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
         accelerator = Accelerator(kwargs_handlers=[accelerator_kwargs])

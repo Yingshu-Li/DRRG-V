@@ -2,7 +2,6 @@ import os
 import torch
 import torch.nn as nn
 import datetime
-
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs, GradientAccumulationPlugin
 from torch.utils.data import Dataset, Sampler, DataLoader
@@ -11,13 +10,14 @@ from trl.trainer import DPOTrainer
 from trl.trainer.utils import DPODataCollatorWithPadding
 
 from transformers import Trainer
-from transformers.trainer import is_sagemaker_mp_enabled, get_parameter_names, has_length, ALL_LAYERNORM_LAYERS, logger, is_accelerate_available, is_datasets_available, GradientAccumulationPlugin
+from transformers.trainer import is_sagemaker_mp_enabled, get_parameter_names, has_length, logger, is_accelerate_available, is_datasets_available
+from accelerate.utils import GradientAccumulationPlugin
 from transformers.trainer_utils import seed_worker
 from transformers.trainer_pt_utils import get_length_grouped_indices as get_length_grouped_indices_hf
 from transformers.trainer_pt_utils import AcceleratorConfig
 from typing import List, Optional
 from datetime import timedelta
-
+ALL_LAYERNORM_LAYERS = [nn.LayerNorm]
 if is_accelerate_available():
     from accelerate import Accelerator, skip_first_batches, InitProcessGroupKwargs
 
@@ -243,13 +243,15 @@ class LLaVATrainer(Trainer):
         grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
         grad_acc_kwargs["sync_with_dataloader"] = False
         gradient_accumulation_plugin = GradientAccumulationPlugin(**grad_acc_kwargs)
-
+        self.is_tp_enabled = getattr(self.args, "tp_parallel", False)
         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
         rank0_print("Setting NCCL timeout to INF to avoid running errors.")
 
         # create accelerator object
         self.accelerator = Accelerator(
-            dispatch_batches=self.args.dispatch_batches, split_batches=self.args.split_batches, deepspeed_plugin=self.args.deepspeed_plugin, gradient_accumulation_plugin=gradient_accumulation_plugin, kwargs_handlers=[accelerator_kwargs]
+             deepspeed_plugin=getattr(self.args, "deepspeed_plugin", None),
+             gradient_accumulation_plugin=gradient_accumulation_plugin,
+            kwargs_handlers=[accelerator_kwargs]
         )
         # some Trainer classes need to use `gather` instead of `gather_for_metrics`, thus we store a flag
         self.gather_function = self.accelerator.gather_for_metrics

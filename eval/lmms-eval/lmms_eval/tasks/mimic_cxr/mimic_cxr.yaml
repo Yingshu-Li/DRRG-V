@@ -1,0 +1,27 @@
+task: "mimic_cxr"
+test_split: test
+metric_list:
+  - metric: rouge_l
+    aggregation: !function utils.mimic_cxr_aggregate_results
+    higher_is_better: true
+  - metric: meteor
+    aggregation: !function utils.mimic_cxr_aggregate_results
+    higher_is_better: true
+  - metric: bleu_1
+    aggregation: !function utils.mimic_cxr_aggregate_results
+    higher_is_better: true
+  - metric: bleu_4
+    aggregation: !function utils.mimic_cxr_aggregate_results
+    higher_is_better: true
+process_results: !function utils.mimic_cxr_process_results
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: ""
+generation_kwargs:
+  max_new_tokens: 256
+  temperature: 0
+  do_sample: False
+include: _default_template_mimic_cxr_yaml
+metadata:
+  version: 1.0

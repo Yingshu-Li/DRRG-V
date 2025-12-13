@@ -449,7 +449,7 @@ conv_qwen = Conversation(
     system="""<|im_start|>system
 You are a helpful assistant.""",
     roles=("<|im_start|>user", "<|im_start|>assistant"),
-    version="qwen",
+    version="qwen1",
     messages=[],
     offset=0,
     sep_style=SeparatorStyle.CHATML,
@@ -458,7 +458,7 @@ You are a helpful assistant.""",
 
 conv_qwen_2_5 = Conversation(
     system="""<|im_start|>system
-You are Qwen, created by Alibaba Cloud. You are a helpful assistant.""",
+You are an assistant in radiology, responsible for analyzing medical imaging studies and generating detailed, structured, and accurate radiology reports.""",
     roles=("<|im_start|>user", "<|im_start|>assistant"),
     version="qwen",
     messages=[],
@@ -489,7 +489,7 @@ conv_llada_plain = Conversation(
 )
 
 conv_llava_llada = Conversation(
-    system="You are a helpful language and vision assistant. " "You are able to understand the visual content that the user provides, " "and assist the user with a variety of tasks using natural language.",
+    system="You are an assistant in radiology, responsible for analyzing medical imaging studies and generating detailed, structured, and accurate radiology reports.",
     roles=("user", "assistant"),
     version="llava_llada",
     messages=[],

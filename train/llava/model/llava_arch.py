@@ -83,9 +83,18 @@ class LlavaMetaModel:
             vision_tower.load_model()
 
             # In case it is frozen by LoRA
-            for p in self.vision_resampler.parameters():
-                p.requires_grad = True
-
+            # for p in self.vision_resampler.parameters():
+            #     p.requires_grad = True
+        # In case it is frozen by LoRA
+        # ⚠ 只对浮点参数开 requires_grad，避免 4bit/8bit 量化下报错
+        if isinstance(self.vision_resampler, list):
+            resamplers = self.vision_resampler
+        else:
+            resamplers = [self.vision_resampler]
+        for resampler in resamplers:
+            for p in resampler.parameters():
+                if p.dtype is not None and torch.is_floating_point(p):
+                    p.requires_grad = True
         self.config.use_mm_proj = True
         self.config.mm_projector_type = getattr(model_args, "mm_projector_type", "linear")
         self.config.mm_hidden_size = getattr(vision_resampler, "hidden_size", vision_tower.hidden_size)
@@ -109,8 +118,12 @@ class LlavaMetaModel:
                 self.image_newline = nn.Parameter(torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std)
         else:
             # In case it is frozen by LoRA
+            # for p in self.mm_projector.parameters():
+            #     p.requires_grad = True
+
             for p in self.mm_projector.parameters():
-                p.requires_grad = True
+                if p.dtype is not None and torch.is_floating_point(p):
+                    p.requires_grad = True
 
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location="cpu")
@@ -122,6 +135,7 @@ class LlavaMetaModel:
             rank0_print(f"Loaded mm projector weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
             incompatible_keys = self.vision_resampler.load_state_dict(get_w(mm_projector_weights, "vision_resampler"), strict=False)
             rank0_print(f"Loaded vision resampler weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
+    
 
 
 def unpad_image(tensor, original_size):

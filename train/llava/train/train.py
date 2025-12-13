@@ -50,7 +50,16 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token
 from llava.utils import rank0_print, process_video_with_pyav, process_video_with_decord, rank_print
-
+from llava.model.language_model.llava_llada import LlavaLLaDAModelLM
+from llava.model.language_model.llava_qwen import LlavaQwen3ModelLM
+import debugpy
+try:
+    # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
+    debugpy.listen(("localhost", 9501))
+    print("Waiting for debugger attach")
+    debugpy.wait_for_client()
+except Exception as e:
+    pass
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -174,7 +183,7 @@ class TrainingArguments(transformers.TrainingArguments):
     verbose_logging: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
     use_conversation_mask: bool=field(default=True)
-
+    evaluation_strategy: Optional[str] = field(default=None)
 
 # @dataclass
 # class EvaluationArguments:
@@ -1710,27 +1719,27 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 **customized_kwargs,
             )
         elif "qwen" in model_args.model_name_or_path.lower():
-            if "moe" in model_args.model_name_or_path.lower() or "A14B" in model_args.model_name_or_path:
-                model = LlavaQwenMoeForCausalLM.from_pretrained(
-                    model_args.model_name_or_path,
-                    cache_dir=training_args.cache_dir,
-                    attn_implementation=training_args.attn_implementation,
-                    torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                    low_cpu_mem_usage=False,
-                    **customized_kwargs,
-                )
-                from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeSparseMoeBlock
+            # if "moe" in model_args.model_name_or_path.lower() or "A14B" in model_args.model_name_or_path:
+            #     model = LlavaQwenMoeForCausalLM.from_pretrained(
+            #         model_args.model_name_or_path,
+            #         cache_dir=training_args.cache_dir,
+            #         attn_implementation=training_args.attn_implementation,
+            #         torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+            #         low_cpu_mem_usage=False,
+            #         **customized_kwargs,
+            #     )
+            #     from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeSparseMoeBlock
 
-                deepspeed.utils.set_z3_leaf_modules(model, [Qwen2MoeSparseMoeBlock])
-            else:
-                model = LlavaQwenForCausalLM.from_pretrained(
-                    model_args.model_name_or_path,
-                    cache_dir=training_args.cache_dir,
-                    attn_implementation=training_args.attn_implementation,
-                    torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                    low_cpu_mem_usage=False,
-                    **customized_kwargs,
-                )
+            #     deepspeed.utils.set_z3_leaf_modules(model, [Qwen2MoeSparseMoeBlock])
+            # else:
+            model = LlavaQwen3ModelLM.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=training_args.cache_dir,
+                attn_implementation=training_args.attn_implementation,
+                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                low_cpu_mem_usage=False,
+                **customized_kwargs,
+            )
         elif "gemma" in model_args.model_name_or_path.lower():
             model = LlavaGemmaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
@@ -1784,6 +1793,7 @@ def train(attn_implementation=None):
         from transformers import BitsAndBytesConfig
 
         bnb_model_from_pretrained_args.update(
+            
             dict(
                 device_map={"": training_args.device},
                 load_in_4bit=training_args.bits == 4,
@@ -1813,8 +1823,8 @@ def train(attn_implementation=None):
 
     if training_args.bits in [4, 8]:
         from peft import prepare_model_for_kbit_training
-
         model.config.torch_dtype = torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)
+        # model.config.torch_dtype = torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
 
     if training_args.gradient_checkpointing:
@@ -1969,18 +1979,22 @@ def train(attn_implementation=None):
             tunable_parts = model_args.mm_tunable_parts.split(",")
             if "mm_mlp_adapter" in tunable_parts:
                 for p in model.get_model().mm_projector.parameters():
-                    p.requires_grad = True
+                    if p.dtype is not None and (torch.is_floating_point(p) or torch.is_complex(p)):
+                       p.requires_grad = True
             if "mm_vision_resampler" in tunable_parts:
                 for p in model.get_model().vision_resampler.parameters():
-                    p.requires_grad = True
+                    if p.dtype is not None and (torch.is_floating_point(p) or torch.is_complex(p)):
+                       p.requires_grad = True
             if "mm_vision_tower" in tunable_parts:
                 for name, param in model.named_parameters():
                     if "vision_tower" in name:
-                        param.requires_grad_(True)
+                        if param.dtype is not None and (torch.is_floating_point(param) or torch.is_complex(param)):
+                           param.requires_grad_(True)
             if "mm_language_model" in tunable_parts:
                 for name, param in model.named_parameters():
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
-                        param.requires_grad_(True)
+                        if param.dtype is not None and (torch.is_floating_point(param) or torch.is_complex(param)):
+                           param.requires_grad_(True)
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)

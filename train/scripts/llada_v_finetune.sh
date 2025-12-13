@@ -1,13 +1,21 @@
 export OMP_NUM_THREADS=8
 export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=3
-export NCCL_SOCKET_IFNAME=eth0
+export NCCL_SOCKET_IFNAME=enp1s0f1np1
 export NCCL_DEBUG=WARN
 export NCCL_DEBUG_SUBSYS=ALL
-
+export HF_HOME="/mnt/sdb/pretrained_models//Qwen3-0.6B-diffusion"
+export HUGGINGFACE_HUB_CACHE="${HF_HOME}/hub"
+export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
+export PYTHONPATH=$(pwd)/$PYTHONPATH
+mkdir -p "${HF_HOME}"
 num_node=$1
 gpu_num=$2
 
+if [[ -z "$num_node" || -z "$gpu_num" ]]; then
+  echo "Usage: bash $0 <num_node> <gpu_num>"
+  exit 1
+fi
 # need to change num_node and gpu_num! 
 # Configuration note: This script is typically run with 4 nodes and 8 GPUs per node.
 # The gradient_accumulation_steps should be adjusted based on your GPU count to maintain effective batch size.
@@ -23,14 +31,14 @@ echo "node_rank ${RANK}"
 echo "gpu_num ${gpu_num}"
 echo "num_node ${num_node}"
 
-LLM_VERSION="GSAI-ML/LLaDA-V"
+LLM_VERSION="dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1"
 LLM_VERSION_CLEAN="${LLM_VERSION//\//_}"
 VISION_MODEL_VERSION="model/siglip2-so400m-patch14-384"
 VISION_MODEL_VERSION_CLEAN="${VISION_MODEL_VERSION//\//_}"
 
 ############### Finetune ################
 
-PROMPT_VERSION="llava_llada"
+PROMPT_VERSION="qwen"
 
 BASE_RUN_NAME="llada_v_finetune"
 echo "BASE_RUN_NAME: ${BASE_RUN_NAME}"
@@ -40,8 +48,8 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --deepspeed scripts/zero3.json \
     --model_name_or_path ${LLM_VERSION} \
     --version ${PROMPT_VERSION} \
-    --data_path "" \
-    --image_folder "" \
+    --data_path "/mnt/sda/shaoyang/model/LLaDA/LLaDA-V/data/train_llava_llada.json" \
+    --image_folder "/mnt/sdb/datasets/mimic_original/2.0.0/files" \
     --video_folder "" \
     --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_language_model" \
     --mm_vision_tower_lr=2e-6 \
@@ -50,10 +58,11 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
+    --mm_resampler_type perceiver \
     --group_by_modality_length True \
-    --image_aspect_ratio anyres_max_4 \
+    --image_aspect_ratio pad \
     --image_grid_pinpoints "(1x1),...,(6x6)" \
-    --mm_patch_merge_type spatial_unpad \
+    --mm_patch_merge_type flat \
     --bf16 True \
     --run_name $BASE_RUN_NAME \
     --output_dir "exp/$BASE_RUN_NAME" \
@@ -71,7 +80,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --tf32 True \
-    --model_max_length 8192 \
+    --model_max_length 128 \
     --gradient_checkpointing True \
     --dataloader_num_workers 0 \
     --lazy_preprocess True \
@@ -80,4 +89,12 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --torch_compile_backend "inductor" \
     --dataloader_drop_last True \
     --attn_implementation sdpa \
-    --use_conversation_mask False
+    --use_conversation_mask False \
+    --lora_enable True \
+    --double_quant True \
+    --quant_type nf4 \
+    --lora_r 4 \
+    --lora_alpha 8 \
+    --lora_dropout 0.1 \
+    --lora_bias "none"
+    # --deepspeed scripts/zero3.json \
