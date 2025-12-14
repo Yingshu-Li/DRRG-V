@@ -32,8 +32,8 @@ from llava.utils import rank0_print
 
 
 class SigLipImageProcessor:
-    def __init__(self, image_mean=(0.5, 0.5, 0.5), image_std=(0.5, 0.5, 0.5), size=(224, 224), crop_size: Dict[str, int] = None, resample=PILImageResampling.BICUBIC, rescale_factor=1 / 255, data_format=ChannelDimension.FIRST):
-        crop_size = crop_size if crop_size is not None else {"height": 224, "width": 224}
+    def __init__(self, image_mean=(0.5, 0.5, 0.5), image_std=(0.5, 0.5, 0.5), size=(384, 384), crop_size: Dict[str, int] = None, resample=PILImageResampling.BICUBIC, rescale_factor=1 / 255, data_format=ChannelDimension.FIRST):
+        crop_size = crop_size if crop_size is not None else {"height": 384, "width": 384}
         crop_size = get_size_dict(crop_size, default_to_square=True, param_name="crop_size")
 
         self.image_mean = image_mean
@@ -78,7 +78,7 @@ class SigLipVisionConfig(PretrainedConfig):
         num_hidden_layers=27,
         num_attention_heads=16,
         num_channels=3,
-        image_size=224,
+        image_size=384,
         patch_size=14,
         hidden_act="gelu_pytorch_tanh",
         layer_norm_eps=1e-6,
@@ -577,12 +577,12 @@ class SigLipVisionTower(nn.Module):
             for image in images:
                 image_forward_out = self.vision_tower(image.to(device=self.device, dtype=self.dtype).unsqueeze(0), output_hidden_states=True)
                 image_feature = image_forward_out.hidden_states[-1].to(image.dtype)
-                assert image_features.shape[-2] == 256
+                assert image_features.shape[-2] == 729
                 image_features.append(image_feature)
         else:
             image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
             image_features = image_forward_outs.hidden_states[-1].to(images.dtype)
-            assert image_features.shape[-2] == 256
+            assert image_features.shape[-2] == 729
 
         return image_features
 

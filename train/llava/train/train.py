@@ -1811,6 +1811,37 @@ def train(attn_implementation=None):
         )
 
     model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
+# ========================== 插入开始 ==========================
+    rank0_print("\n" + "!"*50)
+    rank0_print(f"!!! [DEBUG] 模型实际加载路径: {model.config._name_or_path}")
+    rank0_print(f"!!! [DEBUG] 模型Python类名: {type(model).__name__}")
+    
+    try:
+            # 1. 获取权重对象
+            param = model.get_input_embeddings().weight
+            
+            # 2. 【关键步骤】使用你代码里现成的 maybe_zero_3 函数把权重收集回来
+            #    这个函数会处理 DeepSpeed 的分片逻辑
+            param_gathered = maybe_zero_3(param, ignore_status=True)
+            
+            # 3. 现在的 param_gathered 是完整的，可以打印了
+            sample_weights = param_gathered.view(-1)[:5].cpu().tolist()
+            
+            rank0_print(f"!!! [DEBUG] 权重抽样 (前5个数值): {sample_weights}")
+            
+            if not sample_weights: # 如果还是空
+                rank0_print("!!! [WARNING] 收集后依然为空，请检查 deepspeed 配置")
+            elif all(x == 0 for x in sample_weights):
+                rank0_print("!!! [WARNING] 警告：权重全是 0，可能初始化失败！")
+            else:
+                rank0_print("!!! [SUCCESS] 权重看起来正常（非零且不规则），加载成功！")
+                
+    except Exception as e:
+        rank0_print(f"!!! [DEBUG] 无法获取权重样本: {e}")
+        import traceback
+        rank0_print(traceback.format_exc()) # 打印详细报错方便排查
+
+    rank0_print("!"*50 + "\n")
     model.config.use_cache = False
     if model_args.rope_scaling_factor is not None and model_args.rope_scaling_type is not None:
         model.config.rope_scaling = {

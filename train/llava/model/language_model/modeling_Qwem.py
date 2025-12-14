@@ -958,7 +958,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size].`
+
+        conversation_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Optional tensor used to indicate conversation turns / message grouping inside each sequence. When
+            provided, a conversation mask will be constructed so that tokens are only allowed to attend to tokens
+            from the same or earlier conversation turn (i.e. attention is restricted by conversation turn id).
+            If `attention_mask` is also provided, the two masks will be combined (element-wise) so both padding
+            and conversation boundaries are respected. This is useful for multi-dialogue or multi-message inputs
+            where you want to prevent cross-turn attention beyond permitted boundaries.
 
         Example:
         **kwargs: Unpack[KwargsForCausalLM],
@@ -1043,9 +1051,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # loss = None
         # if labels is not None:
         #     loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-        if self.config.pretraining_tp > 1:
-            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
-            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
+        pretraining_tp = getattr(self.config, "pretraining_tp", 1)
+        if pretraining_tp > 1:
+            lm_head_slices = self.lm_head.weight.split(self.vocab_size // pretraining_tp, dim=0)
+            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
             logits = self.lm_head(hidden_states)

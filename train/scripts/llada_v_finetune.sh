@@ -4,7 +4,7 @@ export NCCL_IB_GID_INDEX=3
 export NCCL_SOCKET_IFNAME=enp1s0f1np1
 export NCCL_DEBUG=WARN
 export NCCL_DEBUG_SUBSYS=ALL
-export HF_HOME="/mnt/sdb/pretrained_models//Qwen3-0.6B-diffusion"
+export HF_HOME="/mnt/sdb/pretrained_models/Qwen3-0.6B-diffusion"
 export HUGGINGFACE_HUB_CACHE="${HF_HOME}/hub"
 export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
 export PYTHONPATH=$(pwd)/$PYTHONPATH
@@ -33,7 +33,7 @@ echo "num_node ${num_node}"
 
 LLM_VERSION="dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1"
 LLM_VERSION_CLEAN="${LLM_VERSION//\//_}"
-VISION_MODEL_VERSION="model/siglip2-so400m-patch14-384"
+VISION_MODEL_VERSION=/mnt/sdb/pretrained_models/siglip2-so400m-patch14-384
 VISION_MODEL_VERSION_CLEAN="${VISION_MODEL_VERSION//\//_}"
 
 ############### Finetune ################
@@ -46,7 +46,7 @@ echo "BASE_RUN_NAME: ${BASE_RUN_NAME}"
 ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_node} --master_addr=${MASTER_ADDR} --master_port ${MASTER_PORT} --node_rank=${RANK} \
     llava/train/train_mem.py \
     --deepspeed scripts/zero3.json \
-    --model_name_or_path ${LLM_VERSION} \
+    --model_name_or_path "/mnt/sdb/pretrained_models/Qwen3-0.6B-diffusion" \
     --version ${PROMPT_VERSION} \
     --data_path "/mnt/sda/shaoyang/model/LLaDA/LLaDA-V/data/train_llava_llada.json" \
     --image_folder "/mnt/sdb/datasets/mimic_original/2.0.0/files" \
@@ -67,7 +67,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --run_name $BASE_RUN_NAME \
     --output_dir "exp/$BASE_RUN_NAME" \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 1 \
+    --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 2 \
     --evaluation_strategy "no" \
@@ -80,21 +80,21 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --tf32 True \
-    --model_max_length 128 \
+    --model_max_length 512 \
     --gradient_checkpointing True \
     --dataloader_num_workers 0 \
     --lazy_preprocess True \
     --report_to tensorboard \
-    --torch_compile True \
-    --torch_compile_backend "inductor" \
     --dataloader_drop_last True \
     --attn_implementation sdpa \
     --use_conversation_mask False \
-    --lora_enable True \
-    --double_quant True \
-    --quant_type nf4 \
-    --lora_r 4 \
-    --lora_alpha 8 \
-    --lora_dropout 0.1 \
-    --lora_bias "none"
+    # --lora_enable True \
+    # --double_quant True \
+    # --quant_type nf4 \
+    # --lora_r 4 \
+    # --lora_alpha 8 \
+    # --lora_dropout 0.1 \
+    # --lora_bias "none"
     # --deepspeed scripts/zero3.json \
+    # --torch_compile False \
+    # --torch_compile_backend "inductor" \

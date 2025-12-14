@@ -42,13 +42,13 @@ class LLavaQwen3Config(Qwen3Config):
 
 
 class LlavaQwen3Model(LlavaMetaModel, Qwen3Model):
-    config_class = Qwen3Config
+    config_class = LLavaQwen3Config
 
     def __init__(self, config: Qwen3Config):
         super(LlavaQwen3Model, self).__init__(config)
 
 class LlavaQwen3ModelLM(Qwen3ForCausalLM, LlavaMetaForCausalLM):
-    config_class = Qwen3Config
+    config_class = LLavaQwen3Config
 
     def __init__(self, config):
         Qwen3ForCausalLM.__init__(self, config)
