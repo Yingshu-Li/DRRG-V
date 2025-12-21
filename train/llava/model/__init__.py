@@ -2,6 +2,7 @@ import os
 
 AVAILABLE_MODELS = {
     "llava_llada": "LlavaLLaDAModelLM, LlavaLLaDAConfig",
+    "llava_qwen": "LlavaQwen3ModelLM, LLavaQwen3Config",    
 }
 
 for model_name, model_classes in AVAILABLE_MODELS.items():

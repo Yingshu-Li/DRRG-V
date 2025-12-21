@@ -40,7 +40,7 @@ VISION_MODEL_VERSION_CLEAN="${VISION_MODEL_VERSION//\//_}"
 
 PROMPT_VERSION="qwen"
 
-BASE_RUN_NAME="llada_v_finetune"
+BASE_RUN_NAME="llada_v_finetune5"
 echo "BASE_RUN_NAME: ${BASE_RUN_NAME}"
 
 ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_node} --master_addr=${MASTER_ADDR} --master_port ${MASTER_PORT} --node_rank=${RANK} \
@@ -55,10 +55,10 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --mm_vision_tower_lr=2e-6 \
     --vision_tower ${VISION_MODEL_VERSION} \
     --mm_projector_type mlp2x_gelu \
+    --pretrain_mm_mlp_adapter "/mnt/sda/shaoyang/model/LLaDA/LLaDA-V/train/llada_v_prepare/mm_projector.bin" \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
-    --mm_resampler_type perceiver \
     --group_by_modality_length True \
     --image_aspect_ratio pad \
     --image_grid_pinpoints "(1x1),...,(6x6)" \
@@ -66,8 +66,8 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --bf16 True \
     --run_name $BASE_RUN_NAME \
     --output_dir "exp/$BASE_RUN_NAME" \
-    --num_train_epochs 1 \
-    --per_device_train_batch_size 4 \
+    --num_train_epochs 2 \
+    --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 2 \
     --evaluation_strategy "no" \
@@ -80,7 +80,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --tf32 True \
-    --model_max_length 512 \
+    --model_max_length 1024 \
     --gradient_checkpointing True \
     --dataloader_num_workers 0 \
     --lazy_preprocess True \
@@ -98,3 +98,4 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     # --deepspeed scripts/zero3.json \
     # --torch_compile False \
     # --torch_compile_backend "inductor" \
+    # --mm_resampler_type perceiver \

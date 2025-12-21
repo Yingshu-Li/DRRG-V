@@ -1631,7 +1631,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         ]
     ):
         cfg_pretrained = AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
-
+        cfg_pretrained.model_type = "llava_qwen3"
     if model_args.use_pos_skipping is not None and model_args.pos_skipping_range is not None:
         overwrite_config["use_pos_skipping"] = model_args.use_pos_skipping
         overwrite_config["pos_skipping_range"] = model_args.pos_skipping_range

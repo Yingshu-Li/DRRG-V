@@ -1559,13 +1559,20 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             return noisy_embeds, p_mask, masked_embed
 
         noisy_embeds, p_mask, masked_embed = forward_process_embeds(inputs_embeds, labels)
-        
+        bsz, seq_len, _ = inputs_embeds.shape
         masked_indices = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
-        prompt_index = (labels == -100).to(torch.int64) # shape (b, l)
-        
+        prompt_index = (labels == -100).to(torch.int64)
+        target_mask = (1 - prompt_index).bool() # shape (b, l)
+        masked_indices_env = (~masked_indices) & (target_mask)
         noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
         noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1]) # shape (b, l)
-
+        noisy_embeds_inv = torch.where(masked_indices_env.view(bsz,seq_len,1),masked_embed,inputs_embeds)
+        labels_env = labels.clone()
+        labels_env[masked_indices]= -100
+        labels[masked_indices_env]= -100
+        labels =  torch.cat([labels,labels_env])
+        noisy_embeds = torch.cat([noisy_embeds,noisy_embeds_inv])
+        p_mask = torch.cat([p_mask, p_mask], dim=0)
         if conversation_ids is not None: 
             conversation_mask = self._build_conversation_mask_optimized(conversation_ids)
             if attention_mask is not None:
@@ -1605,9 +1612,12 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         loss = None
         if labels is not None:
             # Change for MDM
-            token_loss = F.cross_entropy(logits[masked_indices], labels[masked_indices], ignore_index=-100,
-                                         reduction='none') / p_mask[masked_indices]
-            loss = torch.sum(token_loss / noisy_data_length[masked_indices]) / labels.shape[0]
+            token_loss = F.cross_entropy(logits, labels, ignore_index=-100,
+                                         reduction='none') / p_mask
+            # token_loss_env = F.cross_entropy(logits[~masked_indices], labels[~masked_indices], ignore_index=-100,
+            #                              reduction='none') / p_mask[~masked_indices]
+            # token_loss = token_loss_noenv + token_loss_env
+            loss = torch.sum(token_loss / (2*noisy_data_length)) / labels.shape[0]
 
         if not return_dict:
             output = (logits,) + outputs[1:]

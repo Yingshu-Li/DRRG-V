@@ -33,6 +33,7 @@ AVAILABLE_MODELS = {
     "llava_vid": "LlavaVid",
     "slime": "Slime",
     "longva": "LongVA",
+    "llava_oneversion_qwen": "Llava_OneVersion_Qwen",
     "mantis": "Mantis",
     "minicpm_v": "MiniCPM_V",
     "minimonkey": "MiniMonkey",

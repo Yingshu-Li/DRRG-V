@@ -20,7 +20,7 @@ import torch.nn as nn
 
 import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig, LlamaModel, LlamaForCausalLM
-
+import torch.distributed as dist
 
 from torch.nn import CrossEntropyLoss
 
@@ -83,7 +83,11 @@ class LlavaQwen3ModelLM(Qwen3ForCausalLM, LlavaMetaForCausalLM):
         dpo_forward: Optional[bool] = None,
         cache_position=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-
+        #Print batch size and sequence length for debugging
+        if (not dist.is_initialized()) or dist.get_rank() == 0:
+            bs = input_ids.shape[0] if input_ids is not None else (inputs_embeds.shape[0] if inputs_embeds is not None else None)
+            seqlen = input_ids.shape[1] if input_ids is not None else (inputs_embeds.shape[1] if inputs_embeds is not None else None)
+            print(f"[DEBUG] model.forward bs={bs}, seqlen={seqlen}, has_images={images is not None}")
         if inputs_embeds is None and attention_mask is not None:
             # donate multi-dialogue 
             (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels, conversation_ids) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes, is_llada=True)
