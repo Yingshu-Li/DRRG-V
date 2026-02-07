@@ -82,6 +82,9 @@ class LlavaQwen3ModelLM(Qwen3ForCausalLM, LlavaMetaForCausalLM):
         modalities: Optional[List[str]] = ["image"],
         dpo_forward: Optional[bool] = None,
         cache_position=None,
+        sampled_finding_token_ids: Optional[list] = None,
+        remaining_finding_token_ids: Optional[list] = None,
+        all_finding_token_ids: Optional[list] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         #Print batch size and sequence length for debugging
         if (not dist.is_initialized()) or dist.get_rank() == 0:
@@ -124,6 +127,9 @@ class LlavaQwen3ModelLM(Qwen3ForCausalLM, LlavaMetaForCausalLM):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
                 conversation_ids=conversation_ids,
+                sampled_finding_token_ids=sampled_finding_token_ids,
+                remaining_finding_token_ids=remaining_finding_token_ids,
+                all_finding_token_ids=all_finding_token_ids,
             )
 
     @torch.no_grad()

@@ -40,22 +40,23 @@ VISION_MODEL_VERSION_CLEAN="${VISION_MODEL_VERSION//\//_}"
 
 PROMPT_VERSION="qwen"
 
-BASE_RUN_NAME="llada_v_finetune5"
+BASE_RUN_NAME="llada_v_length2"
 echo "BASE_RUN_NAME: ${BASE_RUN_NAME}"
 
 ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_node} --master_addr=${MASTER_ADDR} --master_port ${MASTER_PORT} --node_rank=${RANK} \
     llava/train/train_mem.py \
     --deepspeed scripts/zero3.json \
-    --model_name_or_path "/mnt/sdb/pretrained_models/Qwen3-0.6B-diffusion" \
+    --model_name_or_path "/mnt/sda/shaoyang/model/LLaDA/LLaDA-V/train/exp/llada_v_finetune7" \
     --version ${PROMPT_VERSION} \
-    --stage 2 \
     --data_path "/mnt/sda/shaoyang/model/LLaDA/LLaDA-V/data/train_llava_llada.json" \
     --image_folder "/mnt/sdb/datasets/mimic_original/2.0.0/files" \
     --video_folder "" \
-    --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_language_model" \
+    --mm_tunable_parts="" \
     --mm_vision_tower_lr=2e-6 \
     --vision_tower ${VISION_MODEL_VERSION} \
     --mm_projector_type mlp2x_gelu \
+    --stage 3 \
+    --length_pred_len 400 \
     --pretrain_mm_mlp_adapter "/mnt/sda/shaoyang/model/LLaDA/LLaDA-V/train/llada_v_prepare/mm_projector.bin" \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
@@ -67,21 +68,21 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --bf16 True \
     --run_name $BASE_RUN_NAME \
     --output_dir "exp/$BASE_RUN_NAME" \
-    --num_train_epochs 2 \
-    --per_device_train_batch_size 2 \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 2 \
+    --gradient_accumulation_steps 1 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 5000 \
     --save_total_limit 1 \
-    --learning_rate 1e-5 \
+    --learning_rate 1e-4 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --tf32 True \
-    --model_max_length 1024 \
+    --model_max_length 1600 \
     --gradient_checkpointing True \
     --dataloader_num_workers 0 \
     --lazy_preprocess True \
@@ -89,14 +90,3 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --dataloader_drop_last True \
     --attn_implementation sdpa \
     --use_conversation_mask False \
-    # --lora_enable True \
-    # --double_quant True \
-    # --quant_type nf4 \
-    # --lora_r 4 \
-    # --lora_alpha 8 \
-    # --lora_dropout 0.1 \
-    # --lora_bias "none"
-    # --deepspeed scripts/zero3.json \
-    # --torch_compile False \
-    # --torch_compile_backend "inductor" \
-    # --mm_resampler_type perceiver \

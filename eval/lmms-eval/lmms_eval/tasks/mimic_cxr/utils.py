@@ -7,8 +7,9 @@ Metrics: ROUGE-L, METEOR, BLEU
 import json
 import os
 import re
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from collections import defaultdict
+import evaluate
 
 from loguru import logger as eval_logger
 
@@ -62,40 +63,32 @@ def mimic_cxr_doc_to_target(doc):
     return ""
 
 
-def compute_bleu(predictions: List[str], references: List[str]) -> Dict[str, float]:
-    """Compute BLEU scores."""
-    from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-    
-    smoothing = SmoothingFunction().method1
-    
-    bleu_1_scores = []
-    bleu_2_scores = []
-    bleu_3_scores = []
-    bleu_4_scores = []
-    
-    for pred, ref in zip(predictions, references):
-        pred_tokens = pred.lower().split()
-        ref_tokens = ref.lower().split()
-        
-        if len(pred_tokens) == 0 or len(ref_tokens) == 0:
-            continue
-        
-        bleu_1 = sentence_bleu([ref_tokens], pred_tokens, weights=(1, 0, 0, 0), smoothing_function=smoothing)
-        bleu_2 = sentence_bleu([ref_tokens], pred_tokens, weights=(0.5, 0.5, 0, 0), smoothing_function=smoothing)
-        bleu_3 = sentence_bleu([ref_tokens], pred_tokens, weights=(0.33, 0.33, 0.33, 0), smoothing_function=smoothing)
-        bleu_4 = sentence_bleu([ref_tokens], pred_tokens, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoothing)
-        
-        bleu_1_scores.append(bleu_1)
-        bleu_2_scores.append(bleu_2)
-        bleu_3_scores.append(bleu_3)
-        bleu_4_scores.append(bleu_4)
-    
-    return {
-        'bleu_1': sum(bleu_1_scores) / len(bleu_1_scores) if bleu_1_scores else 0,
-        'bleu_2': sum(bleu_2_scores) / len(bleu_2_scores) if bleu_2_scores else 0,
-        'bleu_3': sum(bleu_3_scores) / len(bleu_3_scores) if bleu_3_scores else 0,
-        'bleu_4': sum(bleu_4_scores) / len(bleu_4_scores) if bleu_4_scores else 0,
-    }
+def compute_bleu(
+    predictions: List[str],
+    references: List[str],
+    bleu_metric: Optional[object] = None,
+) -> Dict[str, float]:
+    # 1. 基本校验
+    if len(predictions) != len(references):
+        raise ValueError(f"样本数不一致: preds={len(predictions)} != refs={len(references)}")
+    if not predictions:
+        return {"bleu_1": 0.0, "bleu_2": 0.0, "bleu_3": 0.0, "bleu_4": 0.0}
+
+    # 4. 准备 metric
+    if bleu_metric is None:
+        bleu_metric = evaluate.load("bleu")
+
+    # 5. 格式封装
+    refs_wrapped = [[r] for r in references]
+
+    scores: Dict[str, float] = {}
+    # 计算 BLEU-1 到 BLEU-4
+    for k in (1, 2, 3, 4):
+        # 即使 preds 中含有空字符串，evaluate.bleu 也能正常处理（不会报错，会给低分）
+        res = bleu_metric.compute(predictions=predictions, references=refs_wrapped, max_order=k)
+        scores[f"bleu_{k}"] = float(res["bleu"])  # 注意：evaluate 输出通常是 0.0-1.0
+
+    return scores
 
 
 def compute_rouge(predictions: List[str], references: List[str]) -> Dict[str, float]:

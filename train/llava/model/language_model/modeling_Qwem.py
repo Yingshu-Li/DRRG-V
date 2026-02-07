@@ -564,6 +564,110 @@ class Qwen3Model(Qwen3PreTrainedModel):
 # class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 
+class LengthDiscriminatorNetwork(nn.Module):
+    """
+    Length discriminator network with 4 transformer blocks followed by a length prediction head.
+    """
+    def __init__(self, config: Qwen3Config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        
+        # Create a lightweight config for the discriminator transformer blocks
+        # Use 4 layers as specified
+        self.num_layers = 4
+        
+        # Create 4 transformer decoder layers
+        self.layers = nn.ModuleList([
+            Qwen3DecoderLayer(config, layer_idx=i) for i in range(self.num_layers)
+        ])
+        
+        # Layer normalization before the head
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # Length prediction head (same as original)
+        self.length_head = nn.Linear(config.hidden_size, 1, bias=False)
+        
+        # Rotary embedding for positional encoding
+        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: Input hidden states from the main model [batch_size, seq_len, hidden_size]
+            attention_mask: Attention mask [batch_size, seq_len]
+            position_ids: Position IDs [batch_size, seq_len]
+            cache_position: Cache position for generation
+        
+        Returns:
+            eos_logits: Length prediction logits [batch_size, seq_len]
+        """
+        # Get positional embeddings
+        if position_ids is None and cache_position is not None:
+            position_ids = cache_position.unsqueeze(0)
+        elif position_ids is None:
+            batch_size, seq_length = hidden_states.shape[:2]
+            position_ids = torch.arange(
+                seq_length, dtype=torch.long, device=hidden_states.device
+            ).unsqueeze(0).expand(batch_size, -1)
+        
+        # Get rotary embeddings
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        if attention_mask is not None:
+            if cache_position is None:
+                batch_size, seq_length = hidden_states.shape[:2]
+                cache_position = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device)
+            
+            dtype, device = hidden_states.dtype, hidden_states.device
+            min_dtype = torch.finfo(dtype).min
+            sequence_length = hidden_states.shape[1]
+            target_length = attention_mask.shape[-1] if attention_mask.dim() >= 2 else cache_position[-1] + 1
+            
+            # Create causal mask (all zeros for full attention in discriminator)
+            causal_mask = torch.zeros((sequence_length, target_length), dtype=dtype, device=device)
+            causal_mask = causal_mask[None, None, :, :].expand(hidden_states.shape[0], 1, -1, -1)
+            
+            # Apply padding mask if attention_mask is provided
+            if attention_mask.dim() == 2:
+                mask_length = attention_mask.shape[-1]
+                # Convert to proper dtype first
+                attn_mask_expanded = attention_mask[:, None, None, :].to(dtype=dtype)
+                padding_mask = attn_mask_expanded.eq(0.0)
+                causal_mask = causal_mask.masked_fill(padding_mask, min_dtype)
+            
+            attention_mask = causal_mask
+        # Pass through transformer layers
+        for layer in self.layers:
+            layer_outputs = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=None,  # No caching for discriminator
+                output_attentions=False,
+                use_cache=False,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs
+            )
+            hidden_states = layer_outputs[0]
+        
+        # Apply final layer norm
+        hidden_states = self.norm(hidden_states)
+        
+        # Apply length prediction head
+        eos_logits = self.length_head(hidden_states).squeeze(-1)  # [batch_size, seq_len]
+        
+        return eos_logits
+
+
 @auto_docstring
 class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
@@ -574,6 +678,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen3Model(config)
         self.vocab_size = config.vocab_size
+        self.stage = getattr(config, 'stage', 3)
+        self.length_pred_len = getattr(config, 'length_pred_len', 300)
+        # Use the new length discriminator network instead of a simple linear layer
+        self.length_discriminator = LengthDiscriminatorNetwork(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
@@ -734,7 +842,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
     @torch.no_grad()
     def generate_with_embeds(self, inputs_embeds, steps=128, gen_length=128, block_length=128, temperature=0.,
-        cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None, stopping_criteria=None, generation_suffix=None, **kwargs):
+        cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None, use_length_prediction=False, stopping_criteria=None, generation_suffix=None, **kwargs):
         '''
         Args:
             inputs_embeds: A tensor of shape (1, l, d).
@@ -745,6 +853,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             cfg_scale: Unsupervised classifier-free guidance scale.
             remasking: Remasking strategy. 'low_confidence' or 'random'.
             mask_id: The toke id of [MASK] is 126336.
+            use_length_prediction: Whether to use length prediction head.
             generation_suffix: (str or None) Generation suffix, such as "The answer is xxx", will be appended to the end
         '''
         # Use mixed precision for faster computation
@@ -762,7 +871,41 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 suffix_len = suffix_embeds.shape[1]
             else:
                 suffix_len = 0
-
+            if use_length_prediction and hasattr(self, 'length_discriminator'):
+                # Prepare embeddings for length prediction
+                masked_embed = self.model.embed_tokens(torch.tensor([mask_id], device=inputs_embeds.device))
+                prompt_len = inputs_embeds.shape[1]
+                
+                # Create full sequence: prompt + gen_length masks
+                length_pred_embeds = masked_embed.repeat(1, prompt_len + gen_length, 1)
+                length_pred_embeds[:, :prompt_len] = inputs_embeds.clone()
+                
+                # Create attention mask for length prediction
+                length_attn_mask = torch.ones((1, prompt_len + gen_length), device=inputs_embeds.device, dtype=torch.long)
+                
+                # Forward pass through the model
+                outputs = self.model(
+                    inputs_embeds=length_pred_embeds,
+                    attention_mask=length_attn_mask,
+                    use_cache=False,
+                ) 
+                hidden_states = outputs.last_hidden_state  # (1, prompt_len + gen_length, hidden_size)
+                # Use the length discriminator network instead of simple linear head
+                eos_scores = self.length_discriminator(hidden_states, attention_mask=length_attn_mask).float()  # (1, prompt_len + gen_length)
+            # Only consider the mask region for EOS prediction
+                mask_region_start = prompt_len
+                mask_region_end = prompt_len + gen_length
+                mask_scores = eos_scores[:, mask_region_start:mask_region_end]  # (1, gen_length)
+            
+                # Find the position with highest EOS score in the mask region
+                predicted_eos_idx = torch.argmax(mask_scores, dim=-1).item()  # Relative to mask_region_start
+                predicted_eos_pos = mask_region_start + predicted_eos_idx  # Absolute position
+                
+                # Update actual_gen_length (number of masks to keep)
+                actual_gen_length = predicted_eos_idx + 1  # +1 because we include the EOS position
+                
+                print(f"[Length Prediction] Original gen_length: {gen_length}, Predicted EOS at position: {predicted_eos_pos}, Actual gen_length: {actual_gen_length}")
+                gen_length = actual_gen_length       
             # Create input in embedding space
             total_length = inputs_embeds.shape[1] + gen_length + suffix_len
             masked_embed = self.model.embed_tokens(torch.tensor([mask_id]).to(inputs_embeds.device)) # shape (1, d)
@@ -780,7 +923,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             # and the remaining gen_length+suffix_len elements are 0 (representing the generated part)
             prompt_index = torch.zeros((1, total_length), dtype=torch.bool, device=inputs_embeds.device)
             prompt_index[:, :inputs_embeds.shape[1]] = 1 # shape (1, l + gen_length + suffix_len)
-
+            block_length = gen_length
             assert gen_length % block_length == 0
             num_blocks = gen_length // block_length
 
@@ -948,6 +1091,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
+        sampled_finding_token_ids: Optional[list] = None,
+        remaining_finding_token_ids: Optional[list] = None,
+        all_finding_token_ids: Optional[list] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
@@ -990,6 +1136,43 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
 
+        def forward_process_core_findings(input_embeds, labels, mask_tokenid_list, eps=1e-3, mask_id=126336):
+            """
+            input_embeds: (b, l, d)
+            labels:       (b, l) with -100 as ignore
+            mask_tokenid_list: list[list[int]] length=b, each inner list are token_ids to mask
+            eps: clamp p in [eps, 1-eps]
+            """
+            b, l, d = input_embeds.shape
+            device = input_embeds.device
+
+            valid_mask = (labels != -100)  # (b, l)
+
+            masked_indices = torch.zeros((b, l), dtype=torch.bool, device=device)
+
+            labels_dtype = labels.dtype if labels.dtype in (torch.int64, torch.int32, torch.int16, torch.int8) else torch.long
+
+            for i, tok_list in enumerate(mask_tokenid_list):
+                if not tok_list:
+                    continue
+                tok = torch.as_tensor(tok_list, device=device, dtype=labels_dtype)
+                hit = torch.isin(labels[i].to(labels_dtype), tok)  # (l,)
+                masked_indices[i] = hit
+
+            masked_indices = masked_indices & valid_mask  # (b, l)
+
+            masked_embed = self.model.embed_tokens(torch.tensor([mask_id], device=device, dtype=torch.long))
+
+            noisy_embeds = torch.where(masked_indices.unsqueeze(-1), masked_embed, input_embeds)  # (b, l, d)
+
+            valid_cnt = valid_mask.sum(dim=1).clamp(min=1)       # (b,)
+            masked_cnt = masked_indices.sum(dim=1)               # (b,)
+            p = (masked_cnt.float() / valid_cnt.float()).clamp(min=eps, max=1.0 - eps)  # (b,)
+            p_mask = p[:, None].expand(b, l)                     # (b, l)
+
+            return noisy_embeds, p_mask, masked_embed, masked_indices
+
+
         def forward_process_embeds(input_embeds, labels, eps=1e-3):
             b, l, d = input_embeds.shape
             t = torch.rand(b, device=input_embeds.device)
@@ -1007,89 +1190,518 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
             return noisy_embeds, p_mask, masked_embed
 
-        noisy_embeds, p_mask, masked_embed = forward_process_embeds(inputs_embeds, labels)
-        bsz, seq_len, _ = inputs_embeds.shape
-        masked_indices = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
-        prompt_index = (labels == -100).to(torch.int64)
-        target_mask = (1 - prompt_index).bool() # shape (b, l)
-        masked_indices_env = (~masked_indices) & (target_mask)
-        noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
-        noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1]) # shape (b, l)
-        noisy_embeds_inv = torch.where(masked_indices_env.view(bsz,seq_len,1),masked_embed,inputs_embeds)
-        labels_env = labels.clone()
-        labels_env[masked_indices]= -100
-        labels[masked_indices_env]= -100
-        labels =  torch.cat([labels,labels_env])
-        noisy_embeds = torch.cat([noisy_embeds,noisy_embeds_inv])
-        p_mask_inv = 1.0 - p_mask
-        p_mask = torch.cat([p_mask, p_mask_inv], dim=0)
-        noisy_data_length = noisy_data_length.repeat(2, 1)
-        if conversation_ids is not None: 
-            conversation_mask = self._build_conversation_mask_optimized(conversation_ids)
-            if attention_mask is not None:
-                # 1. Dimension expansion
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, length) -> (batch, 1, 1, length)
-                attention_mask = attention_mask.expand_as(conversation_mask) # (batch, 1, 1, length) -> (batch, 1, length, length)
-                # 2. Mask combination (element-wise multiplication)
-                combined_mask = conversation_mask * attention_mask
+        def forward_not_core_embeds(input_embeds, labels, eps=1e-3, core_indices=None):
+            b, l, d = input_embeds.shape
+            t = torch.rand(b, device=input_embeds.device)
+            p_mask = (1 - eps) * t + eps
+            p_mask = p_mask[:, None].repeat(1, l)
+
+            masked_indices = torch.rand((b, l), device=input_embeds.device) < p_mask
+            # Add label condition filtering
+            valid_mask = (labels != -100) # Create valid encoding
+            masked_indices = masked_indices & valid_mask & (~core_indices) # Combine random encoding and valid encoding
+            # Magic number 126336 stands for the tokenizer special token,
+            # Magic embeddings, which is used for [MASK] token here,
+            masked_embed = self.model.embed_tokens(torch.tensor([126336]).to(input_embeds.device))
+            noisy_embeds = torch.where(masked_indices.unsqueeze(-1), masked_embed, input_embeds)
+
+            return noisy_embeds, p_mask, masked_embed, t
+        
+        def forward_core_embeds(input_embeds, labels, eps=1e-3, core_indices=None, t=None):
+            b, l, d = input_embeds.shape
+            t_core = torch.clamp(t * 1.2, max=1.0)
+            p_mask = (1 - eps) * t_core + eps
+            p_mask = p_mask[:, None].repeat(1, l)
+
+            masked_indices = torch.rand((b, l), device=input_embeds.device) < p_mask
+            # Add label condition filtering
+            valid_mask = (labels != -100) # Create valid encoding
+            masked_indices = masked_indices & valid_mask & core_indices # Combine random encoding and valid encoding
+            # Magic number 126336 stands for the tokenizer special token,
+            # Magic embeddings, which is used for [MASK] token here,
+            masked_embed = self.model.embed_tokens(torch.tensor([126336]).to(input_embeds.device))
+            noisy_embeds = torch.where(masked_indices.unsqueeze(-1), masked_embed, input_embeds)
+
+            return noisy_embeds, p_mask, masked_embed    
+    
+        if self.stage == 1:
+            all_finding_token_ids = all_finding_token_ids if all_finding_token_ids is not None else []
+            _, _, _, core_indices = forward_process_core_findings(inputs_embeds, labels, all_finding_token_ids)
+            noisy_embeds, p_mask, masked_embed, t = forward_not_core_embeds(inputs_embeds, labels, core_indices=core_indices)
+            masked_indices_nocore = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
+            noisy_embeds_core, p_mask_core, masked_embed = forward_core_embeds(noisy_embeds, labels, core_indices=core_indices, t=t)
+            masked_indices = self.get_masked_indices_from_embeds(noisy_embeds_core, masked_embed) # shape (b, l)
+            p_mask_inv = 1.0 - p_mask
+            p_mask = torch.where(core_indices, p_mask_core, p_mask)
+            bsz, seq_len, _ = inputs_embeds.shape
+            prompt_index = (labels == -100).to(torch.int64)
+            target_mask = (1 - prompt_index).bool() # shape (b, l)
+            masked_indices_nocore_env = (~masked_indices_nocore) & (target_mask) & (~core_indices) # shape (b, l)
+            noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
+            noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1]) # shape (b, l)
+            noisy_embeds_inv = torch.where(masked_indices_nocore_env.view(bsz,seq_len,1),masked_embed,inputs_embeds)
+            t_inv = 1.0 - t
+            noisy_embeds_inv_core, p_mask_core_inv, masked_embed = forward_core_embeds(noisy_embeds_inv, labels, core_indices=core_indices, t=t_inv)
+            masked_indices_inv = self.get_masked_indices_from_embeds(noisy_embeds_inv_core, masked_embed)            
+            labels_env = labels.clone()
+            labels_env[~masked_indices_inv]= -100
+            labels[~masked_indices]= -100
+            labels =  torch.cat([labels,labels_env])
+            noisy_embeds = torch.cat([noisy_embeds_core,noisy_embeds_inv_core])
+            p_mask_inv = torch.where(core_indices, p_mask_core_inv, p_mask_inv)
+            p_mask = torch.cat([p_mask, p_mask_inv], dim=0)
+            noisy_data_length = noisy_data_length.repeat(2, 1)
+            if conversation_ids is not None: 
+                conversation_mask = self._build_conversation_mask_optimized(conversation_ids)
+                if attention_mask is not None:
+                    # 1. Dimension expansion
+                    attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, length) -> (batch, 1, 1, length)
+                    attention_mask = attention_mask.expand_as(conversation_mask) # (batch, 1, 1, length) -> (batch, 1, length, length)
+                    # 2. Mask combination (element-wise multiplication)
+                    combined_mask = conversation_mask * attention_mask
+                else:
+                    # If attention_mask is None, directly use conversation_mask
+                    combined_mask = conversation_mask 
+                attention_mask = combined_mask
+
+            # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=noisy_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            hidden_states = outputs.last_hidden_state
+            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+            # slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            # logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+            # loss = None
+            # if labels is not None:
+            #     loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            pretraining_tp = getattr(self.config, "pretraining_tp", 1)
+            if pretraining_tp > 1:
+                lm_head_slices = self.lm_head.weight.split(self.vocab_size // pretraining_tp, dim=0)
+                logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(pretraining_tp)]
+                logits = torch.cat(logits, dim=-1)
             else:
-                # If attention_mask is None, directly use conversation_mask
-                combined_mask = conversation_mask 
-            attention_mask = combined_mask
+                logits = self.lm_head(hidden_states)
+            logits = logits.float()
+            logits = logits.transpose(1, 2)
+            loss = None
+            if labels is not None:
+                # Change for MDM
+                token_loss = F.cross_entropy(logits, labels, ignore_index=-100,
+                                            reduction='none') / p_mask
+                # token_loss_env = F.cross_entropy(logits[~masked_indices], labels[~masked_indices], ignore_index=-100,
+                #                              reduction='none') / p_mask[~masked_indices]
+                # token_loss = token_loss_noenv + token_loss_env
+                token_loss = token_loss
+                loss = torch.sum(token_loss / noisy_data_length) / labels.shape[0]
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=noisy_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-            **kwargs,
-        )
+            if not return_dict:
+                output = (logits,) + outputs[1:]
+                return (loss,) + output if loss is not None else output
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
 
-        hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        # slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        # logits = self.lm_head(hidden_states[:, slice_indices, :])
+        # if self.stage == 1:
+        #     sampled_finding_token_ids = sampled_finding_token_ids if sampled_finding_token_ids is not None else []
+        #     remaining_finding_token_ids = remaining_finding_token_ids if remaining_finding_token_ids is not None else []
+        #     _, _, _, weight_indices = forward_process_core_findings(inputs_embeds, labels, sampled_finding_token_ids)
+        #     _, _, _, weigth_indices_inv = forward_process_core_findings(inputs_embeds, labels, remaining_finding_token_ids)
+        #     weight_mask = torch.cat([weight_indices,weigth_indices_inv])
+        #     noisy_embeds, p_mask, masked_embed = forward_process_embeds(inputs_embeds, labels)
+        #     bsz, seq_len, _ = inputs_embeds.shape
+        #     masked_indices = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
+        #     prompt_index = (labels == -100).to(torch.int64)
+        #     target_mask = (1 - prompt_index).bool() # shape (b, l)
+        #     masked_indices_env = (~masked_indices) & (target_mask)
+        #     noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
+        #     noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1]) # shape (b, l)
+        #     noisy_embeds_inv = torch.where(masked_indices_env.view(bsz,seq_len,1),masked_embed,inputs_embeds)
+        #     labels_env = labels.clone()
+        #     labels_env[masked_indices]= -100
+        #     labels[masked_indices_env]= -100
+        #     labels =  torch.cat([labels,labels_env])
+        #     noisy_embeds = torch.cat([noisy_embeds,noisy_embeds_inv])
+        #     p_mask_inv = 1.0 - p_mask
+        #     p_mask = torch.cat([p_mask, p_mask_inv], dim=0)
+        #     noisy_data_length = noisy_data_length.repeat(2, 1)
+        #     loss_weight = torch.ones_like(labels, dtype=torch.float)  # shape: (2*b, l)
+        #     loss_weight[weight_mask] = 2.0
+        #     if conversation_ids is not None: 
+        #         conversation_mask = self._build_conversation_mask_optimized(conversation_ids)
+        #         if attention_mask is not None:
+        #             # 1. Dimension expansion
+        #             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, length) -> (batch, 1, 1, length)
+        #             attention_mask = attention_mask.expand_as(conversation_mask) # (batch, 1, 1, length) -> (batch, 1, length, length)
+        #             # 2. Mask combination (element-wise multiplication)
+        #             combined_mask = conversation_mask * attention_mask
+        #         else:
+        #             # If attention_mask is None, directly use conversation_mask
+        #             combined_mask = conversation_mask 
+        #         attention_mask = combined_mask
 
-        # loss = None
-        # if labels is not None:
-        #     loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-        pretraining_tp = getattr(self.config, "pretraining_tp", 1)
-        if pretraining_tp > 1:
-            lm_head_slices = self.lm_head.weight.split(self.vocab_size // pretraining_tp, dim=0)
-            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(pretraining_tp)]
-            logits = torch.cat(logits, dim=-1)
-        else:
-            logits = self.lm_head(hidden_states)
-        logits = logits.float()
-        logits = logits.transpose(1, 2)
-        loss = None
-        if labels is not None:
-            # Change for MDM
-            token_loss = F.cross_entropy(logits, labels, ignore_index=-100,
-                                         reduction='none') / p_mask
-            # token_loss_env = F.cross_entropy(logits[~masked_indices], labels[~masked_indices], ignore_index=-100,
-            #                              reduction='none') / p_mask[~masked_indices]
-            # token_loss = token_loss_noenv + token_loss_env
-            loss = torch.sum(token_loss / noisy_data_length) / labels.shape[0]
+        #     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        #     outputs = self.model(
+        #         input_ids=input_ids,
+        #         attention_mask=attention_mask,
+        #         position_ids=position_ids,
+        #         past_key_values=past_key_values,
+        #         inputs_embeds=noisy_embeds,
+        #         use_cache=use_cache,
+        #         output_attentions=output_attentions,
+        #         output_hidden_states=output_hidden_states,
+        #         return_dict=return_dict,
+        #         cache_position=cache_position,
+        #         **kwargs,
+        #     )
 
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+        #     hidden_states = outputs.last_hidden_state
+        #     # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        #     # slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        #     # logits = self.lm_head(hidden_states[:, slice_indices, :])
 
+        #     # loss = None
+        #     # if labels is not None:
+        #     #     loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+        #     pretraining_tp = getattr(self.config, "pretraining_tp", 1)
+        #     if pretraining_tp > 1:
+        #         lm_head_slices = self.lm_head.weight.split(self.vocab_size // pretraining_tp, dim=0)
+        #         logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(pretraining_tp)]
+        #         logits = torch.cat(logits, dim=-1)
+        #     else:
+        #         logits = self.lm_head(hidden_states)
+        #     logits = logits.float()
+        #     logits = logits.transpose(1, 2)
+        #     loss = None
+        #     if labels is not None:
+        #         # Change for MDM
+        #         token_loss = F.cross_entropy(logits, labels, ignore_index=-100,
+        #                                     reduction='none') / p_mask
+        #         # token_loss_env = F.cross_entropy(logits[~masked_indices], labels[~masked_indices], ignore_index=-100,
+        #         #                              reduction='none') / p_mask[~masked_indices]
+        #         # token_loss = token_loss_noenv + token_loss_env
+        #         token_loss = token_loss * loss_weight 
+        #         loss = torch.sum(token_loss / noisy_data_length) / labels.shape[0]
+
+        #     if not return_dict:
+        #         output = (logits,) + outputs[1:]
+        #         return (loss,) + output if loss is not None else output
+        #     return CausalLMOutputWithPast(
+        #         loss=loss,
+        #         logits=logits,
+        #         past_key_values=outputs.past_key_values,
+        #         hidden_states=outputs.hidden_states,
+        #         attentions=outputs.attentions,
+        #     )
+        
+# 2 stage remask stage 1
+            # masked_len = masked_indices.sum(dim=-1, keepdim=True)
+            # masked_len = masked_len.repeat(1, noisy_embeds.shape[1])
+            # masked_len_inv = masked_indices_inv.sum(dim=-1, keepdim=True)
+            # masked_len_inv = masked_len_inv.repeat(1, noisy_embeds.shape[1])
+            # noisy_data_length = torch.cat([masked_len, masked_len_inv])
+            # prompt_index = (labels == -100).to(torch.int64)
+            # noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
+            # noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1])
+            # noisy_data_length = noisy_data_length.repeat(2, 1)
+            # labels_inv = labels.clone()
+            # labels_inv[~masked_indices_inv]= -100
+            # labels[~masked_indices]= -100
+            # labels =  torch.cat([labels,labels_inv])
+            # noisy_embeds = torch.cat([noisy_embeds,noisy_embeds_inv])
+            # p_mask = torch.cat([p_mask, p_mask_inv], dim=0)
+            # if conversation_ids is not None: 
+            #     conversation_mask = self._build_conversation_mask_optimized(conversation_ids)
+            #     if attention_mask is not None:
+            #         # 1. Dimension expansion
+            #         attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, length) -> (batch, 1, 1, length)
+            #         attention_mask = attention_mask.expand_as(conversation_mask) # (batch, 1, 1, length) -> (batch, 1, length, length)
+            #         # 2. Mask combination (element-wise multiplication)
+            #         combined_mask = conversation_mask * attention_mask
+            #     else:
+            #         # If attention_mask is None, directly use conversation_mask
+            #         combined_mask = conversation_mask 
+            #     attention_mask = combined_mask
+
+            # # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+            # outputs = self.model(
+            #     input_ids=input_ids,
+            #     attention_mask=attention_mask,
+            #     position_ids=position_ids,
+            #     past_key_values=past_key_values,
+            #     inputs_embeds=noisy_embeds,
+            #     use_cache=use_cache,
+            #     output_attentions=output_attentions,
+            #     output_hidden_states=output_hidden_states,
+            #     return_dict=return_dict,
+            #     cache_position=cache_position,
+            #     **kwargs,
+            # )
+
+            # hidden_states = outputs.last_hidden_state
+            # # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+            # # slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            # # logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+            # # loss = None
+            # # if labels is not None:
+            # #     loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            # pretraining_tp = getattr(self.config, "pretraining_tp", 1)
+            # if pretraining_tp > 1:
+            #     lm_head_slices = self.lm_head.weight.split(self.vocab_size // pretraining_tp, dim=0)
+            #     logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(pretraining_tp)]
+            #     logits = torch.cat(logits, dim=-1)
+            # else:
+            #     logits = self.lm_head(hidden_states)
+            # logits = logits.float()
+            # logits = logits.transpose(1, 2)
+            # loss = None
+            # if labels is not None:
+            #     # Change for MDM
+            #     token_loss = F.cross_entropy(logits, labels, ignore_index=-100,
+            #                                 reduction='none') / p_mask
+            #     # token_loss_env = F.cross_entropy(logits[~masked_indices], labels[~masked_indices], ignore_index=-100,
+            #     #                              reduction='none') / p_mask[~masked_indices]
+            #     # token_loss = token_loss_noenv + token_loss_env
+            #     loss = torch.sum(token_loss / noisy_data_length) / labels.shape[0]
+
+            # if not return_dict:
+            #     output = (logits,) + outputs[1:]
+            #     return (loss,) + output if loss is not None else output
+            # return CausalLMOutputWithPast(
+            #     loss=loss,
+            #     logits=logits,
+            #     past_key_values=outputs.past_key_values,
+            #     hidden_states=outputs.hidden_states,
+            #     attentions=outputs.attentions,
+            # )
+        
+        if self.stage == 2:
+            noisy_embeds, p_mask, masked_embed = forward_process_embeds(inputs_embeds, labels)
+            bsz, seq_len, _ = inputs_embeds.shape
+            masked_indices = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
+            prompt_index = (labels == -100).to(torch.int64)
+            target_mask = (1 - prompt_index).bool() # shape (b, l)
+            masked_indices_env = (~masked_indices) & (target_mask)
+            noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
+            noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1]) # shape (b, l)
+            noisy_embeds_inv = torch.where(masked_indices_env.view(bsz,seq_len,1),masked_embed,inputs_embeds)
+            labels_env = labels.clone()
+            labels_env[masked_indices]= -100
+            labels[masked_indices_env]= -100
+            labels =  torch.cat([labels,labels_env])
+            noisy_embeds = torch.cat([noisy_embeds,noisy_embeds_inv])
+            p_mask_inv = 1.0 - p_mask
+            p_mask = torch.cat([p_mask, p_mask_inv], dim=0)
+            noisy_data_length = noisy_data_length.repeat(2, 1)
+            if conversation_ids is not None: 
+                conversation_mask = self._build_conversation_mask_optimized(conversation_ids)
+                if attention_mask is not None:
+                    # 1. Dimension expansion
+                    attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, length) -> (batch, 1, 1, length)
+                    attention_mask = attention_mask.expand_as(conversation_mask) # (batch, 1, 1, length) -> (batch, 1, length, length)
+                    # 2. Mask combination (element-wise multiplication)
+                    combined_mask = conversation_mask * attention_mask
+                else:
+                    # If attention_mask is None, directly use conversation_mask
+                    combined_mask = conversation_mask 
+                attention_mask = combined_mask
+
+            # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=noisy_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            hidden_states = outputs.last_hidden_state
+            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+            # slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            # logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+            # loss = None
+            # if labels is not None:
+            #     loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            pretraining_tp = getattr(self.config, "pretraining_tp", 1)
+            if pretraining_tp > 1:
+                lm_head_slices = self.lm_head.weight.split(self.vocab_size // pretraining_tp, dim=0)
+                logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(pretraining_tp)]
+                logits = torch.cat(logits, dim=-1)
+            else:
+                logits = self.lm_head(hidden_states)
+            logits = logits.float()
+            logits = logits.transpose(1, 2)
+            loss = None
+            if labels is not None:
+                # Change for MDM
+                token_loss = F.cross_entropy(logits, labels, ignore_index=-100,
+                                            reduction='none') / p_mask
+                # token_loss_env = F.cross_entropy(logits[~masked_indices], labels[~masked_indices], ignore_index=-100,
+                #                              reduction='none') / p_mask[~masked_indices]
+                # token_loss = token_loss_noenv + token_loss_env
+                loss = torch.sum(token_loss / noisy_data_length) / labels.shape[0]
+
+            if not return_dict:
+                output = (logits,) + outputs[1:]
+                return (loss,) + output if loss is not None else output
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+        
+        if self.stage == 3:
+            # if input_ids is None:
+            #     raise ValueError("input_ids is required when stage == 3.")
+
+            length_pred_len = self.length_pred_len
+            eos_token_id = getattr(self.config, "eos_token_id", None)
+            if eos_token_id is None:
+                raise ValueError("config.eos_token_id must be set when stage == 3.")
+            pad_token_id = getattr(self.config, "pad_token_id", None)
+            mask_id = kwargs.pop("mask_id", 126336)
+            # prompt_index = (labels == -100).to(torch.int64)
+            # prompt_embeds = inputs_embeds[:, :prompt_index, :]
+            prompt_lens = ((labels == -100) & (attention_mask == 1)).sum(dim=1)
+            bsz, seq_len,  _ = inputs_embeds.shape
+            masked_embed = self.model.embed_tokens(torch.tensor([mask_id], device=inputs_embeds.device))
+            eos_embed = self.model.embed_tokens(torch.tensor([eos_token_id], device=inputs_embeds.device))
+            eos_label_mask = (labels == eos_token_id)
+            if eos_label_mask.sum() == 0:
+                raise ValueError("No EOS token found in labels when stage == 3.")
+            
+            pos_indices = torch.arange(labels.shape[1], device=labels.device).unsqueeze(0).expand(bsz, -1)
+            eos_label_positions = torch.where(eos_label_mask, pos_indices, torch.full_like(pos_indices, -1))
+            eos_pos_orig = eos_label_positions.max(dim=1).values
+            # eos_pos_orig = torch.zeros(bsz, dtype=torch.long, device=inputs_embeds.device)
+            # for i in range(bsz):
+            #     p_len = int(prompt_lens[i])
+            #     answer_embeds = inputs_embeds[i, p_len:, :]
+            #     abs_diff = torch.abs(answer_embeds - eos_embed)
+            #     tolerance = 1e-5 + 1e-5 * torch.abs(eos_embed)
+            #     is_eos = (abs_diff <= tolerance).all(dim=-1) 
+            #     answer_len = answer_embeds.shape[0]
+            #     pos_in_answer = torch.arange(answer_len, device=inputs_embeds.device)
+            #     eos_pos_in_answer = torch.where(is_eos, pos_in_answer, torch.full_like(pos_in_answer, -1))
+            #     max_eos_pos_in_answer = eos_pos_in_answer.max()
+            #     eos_pos_orig[i] = p_len + max_eos_pos_in_answer
+            mask_embeds = masked_embed.repeat(bsz, length_pred_len, 1)
+            pad_embed_unit = self.model.embed_tokens(torch.tensor([pad_token_id], device=inputs_embeds.device))
+            max_total_len = int(prompt_lens.max().item() + length_pred_len)
+            length_embeds = pad_embed_unit.repeat(bsz, max_total_len, 1)
+            attention_mask = torch.zeros((bsz, max_total_len), device=inputs_embeds.device, dtype=torch.long)
+            
+            for i in range(bsz):
+                p_len = int(prompt_lens[i])
+                valid_prompt = inputs_embeds[i, :p_len, :]
+                mask_region = mask_embeds[i]
+                combined = torch.cat([valid_prompt, mask_region], dim=0)
+                actual_len_i = p_len + length_pred_len
+                length_embeds[i, :actual_len_i, :] = combined
+                attention_mask[i, :actual_len_i] = 1
+            actual_len = prompt_lens + length_pred_len
+            # eos_mask = input_ids == eos_token_id
+            # if eos_mask.sum() == 0:
+            #     raise ValueError("No eos_token_id found in input_ids when stage == 3.")
+            # pos_orig = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(bsz, -1)
+            # eos_pos = torch.where(eos_mask, pos_orig, torch.full_like(pos_orig, -1))
+            # eos_pos_orig = eos_pos.max(dim=1).values
+            if (eos_pos_orig < 0).any():
+                print("No eos_token_id found in input_ids when stage == 3.")
+            if (eos_pos_orig >= actual_len).any():
+                print("eos position is outside (prompt_len + length_pred_len) for some samples.")
+            position_ids_new = torch.arange(max_total_len, device=inputs_embeds.device).unsqueeze(0).expand(bsz, -1)
+            mask_start = prompt_lens.unsqueeze(1)
+            mask_end   = (prompt_lens + length_pred_len).unsqueeze(1)
+            mask_length = (position_ids_new >= mask_start) & (position_ids_new < mask_end)
+            prompt_mask = position_ids_new < prompt_lens.unsqueeze(1)         
+            pad_mask    = attention_mask == 0                     
+            ignore_mask = prompt_mask | pad_mask
+            gt = torch.zeros((bsz, max_total_len), device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            # gt[ignore_mask] = neg_inf
+            batch_idx = torch.arange(bsz, device=inputs_embeds.device)
+            gt[batch_idx, eos_pos_orig] = 1.0
+
+            outputs = self.model(
+                input_ids=None,
+                attention_mask=attention_mask,
+                position_ids=position_ids_new,
+                past_key_values=past_key_values,
+                inputs_embeds=length_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            hidden_states = outputs.last_hidden_state
+            # Use the length discriminator network
+            eos_logits = self.length_discriminator(
+                hidden_states, 
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                cache_position=cache_position
+            )
+            eos_logits = eos_logits.float()
+            neg = torch.finfo(eos_logits.dtype).min
+            scores = eos_logits.masked_fill(~mask_length, neg)
+            loss = None
+            if gt is not None:
+                target = gt.argmax(dim=1).long()
+                print(f"Prompt Len: {prompt_lens.tolist()}, GT EOS: {eos_pos_orig.tolist()}, Pred EOS: {scores.argmax(dim=1).tolist()}")
+                length_loss = F.cross_entropy(scores, target, reduction='mean')    
+            # gt_delta = (eos_pos_orig - prompt_lens).float()
+            # scores = []
+            # for i in range(bsz):
+            #     p = int(prompt_lens[i].item())
+            #     scores.append(eos_logits[i, p:p + length_pred_len])
+            # scores = torch.stack(scores, dim=0)     
+            # valid = (eos_pos_orig >= 0) & (gt_delta >= 0) & (gt_delta < length_pred_len)
+            # print(f"Prompt Len: {prompt_lens.tolist()}, GT EOS: {eos_pos_orig.tolist()}, Pred EOS: {scores.argmax(dim=1).tolist()}")
+            # if valid.sum().item() == 0:
+            #     length_loss = eos_logits.sum() * 0.0
+            # else:
+            #     sr = scores[valid]
+            #     gd = gt_delta[valid]
+            #     prob = torch.softmax(sr, dim=-1)
+            #     pos = torch.arange(length_pred_len, device=sr.device, dtype=sr.dtype)
+            #     pred_delta = (prob * pos[None, :]).sum(dim=-1)
+            #     length_loss = torch.nn.functional.smooth_l1_loss(pred_delta, gd, reduction="mean")     
+            return CausalLMOutputWithPast(
+                loss=length_loss,
+                logits=eos_logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
 
 @auto_docstring(
     custom_intro="""
@@ -1333,3 +1945,4 @@ __all__ = [
     "Qwen3ForSequenceClassification",
     "Qwen3ForTokenClassification",
 ]
+

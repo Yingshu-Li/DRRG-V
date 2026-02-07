@@ -126,6 +126,10 @@ class ModelArguments:
     delay_load: Optional[bool] = field(default=True)
     add_faster_video: Optional[bool] = field(default=False)
     faster_token_stride: Optional[int] = field(default=10)
+    
+    # Stage3 length prediction parameters
+    stage: Optional[int] = field(default=2, metadata={"help": "Training stage: 2 for MDM, 3 for length prediction"})
+    length_pred_len: Optional[int] = field(default=300, metadata={"help": "Max length for length prediction in stage 3"})
 
 
 
@@ -1494,8 +1498,170 @@ class LazySupervisedDataset(Dataset):
         else:
             prompt = None
 
+        core_findings = self.list_data_dict[i].get("core_findings", [])
+
+        sampled_finding_token_ids = []
+        remaining_finding_token_ids = []
+        all_finding_token_ids = []
+        if core_findings:
+            input_ids = data_dict["labels"]
+            input_ids_list = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
+
+            # 防御：如果是 [1, L] 这种，拉平
+            if isinstance(input_ids_list, (list, tuple)) and input_ids_list and isinstance(input_ids_list[0], (list, tuple)):
+                if len(input_ids_list) == 1:
+                    input_ids_list = input_ids_list[0]
+                else:
+                    raise ValueError(f"input_ids_list is 2D with batch size {len(input_ids_list)}; expected 1D ids.")
+
+            # ========= 1) 过滤掉无法 decode 的占位符（例如 -100）=========
+            vocab_size = getattr(self.tokenizer, "vocab_size", None)
+
+            safe_ids = []
+            for tid in input_ids_list:
+                if tid is None:
+                    continue
+                if isinstance(tid, bool):
+                    continue
+                if not isinstance(tid, int):
+                    try:
+                        tid = int(tid)
+                    except Exception:
+                        continue
+                if tid < 0:  # 过滤所有负数占位符：-100 / -200 等
+                    continue
+                if vocab_size is not None and tid >= vocab_size:
+                    continue
+                safe_ids.append(tid)
+
+            if safe_ids:
+                # 2) 解码过滤后的 ids
+                source_text = self.tokenizer.decode(safe_ids, skip_special_tokens=True)
+                source_text_lower = source_text.lower()
+
+                # ========= 3) 构建 char_to_token 映射（保证与 source_text 对齐）=========
+                def build_char_to_token_fast(tokenizer, ids, full_text):
+                    cum = 0
+                    char_to_token = []
+                    for tid in ids:
+                        piece = tokenizer.decode([tid], skip_special_tokens=True)
+                        if piece is None:
+                            return None
+                        cum += len(piece)
+                        char_to_token.append(cum)
+                    if cum != len(full_text):
+                        return None
+                    return char_to_token
+
+                def build_char_to_token_slow(tokenizer, ids):
+                    char_to_token = []
+                    for i in range(len(ids)):
+                        decoded = tokenizer.decode(ids[: i + 1], skip_special_tokens=True)
+                        char_to_token.append(len(decoded))
+                    return char_to_token
+
+                char_to_token = build_char_to_token_fast(self.tokenizer, safe_ids, source_text)
+                if char_to_token is None:
+                    char_to_token = build_char_to_token_slow(self.tokenizer, safe_ids)
+
+                def charpos_to_token_range(text_pos, word_end_pos):
+                    start_token_idx = None
+                    for idx in range(len(char_to_token)):
+                        if char_to_token[idx] > text_pos:
+                            start_token_idx = idx
+                            break
+                    if start_token_idx is None:
+                        return None
+
+                    end_token_idx = start_token_idx
+                    for idx in range(start_token_idx, len(char_to_token)):
+                        if char_to_token[idx] >= word_end_pos:
+                            end_token_idx = idx
+                            break
+                    return start_token_idx, end_token_idx
+
+                # ========= 4) 逐词 find()，最后返回 report span 的 token ids（不是索引）=========
+                def match_finding_to_token_ids(finding_text):
+                    words = [w for w in finding_text.strip().split() if w]
+                    if not words:
+                        return None
+
+                    search_start_char = 0
+                    span_start_tok = None
+                    span_end_tok = None
+
+                    for word in words:
+                        w_lower = word.lower()
+                        text_pos = source_text_lower.find(w_lower, search_start_char)
+                        if text_pos == -1:
+                            return None
+                        word_end_pos = text_pos + len(w_lower)
+
+                        tr = charpos_to_token_range(text_pos, word_end_pos)
+                        if tr is None:
+                            return None
+
+                        s_tok, e_tok = tr
+                        if span_start_tok is None:
+                            span_start_tok = s_tok
+                        span_end_tok = e_tok
+
+                        search_start_char = word_end_pos
+
+                    if span_start_tok is None or span_end_tok is None:
+                        return None
+
+                    # ✅ 返回 span 覆盖的 token ids（会包含 finding 中没有但 report 中夹着的词，如 “or”）
+                    return safe_ids[span_start_tok : span_end_tok + 1]
+
+                finding_token_ids_list = []
+                for finding in core_findings:
+                    matched_token_ids = match_finding_to_token_ids(finding)
+                    if matched_token_ids is not None:
+                        finding_token_ids_list.append(matched_token_ids)
+
+                if finding_token_ids_list:
+                    all_finding_token_ids = [tid for sub in finding_token_ids_list for tid in sub]
+
+                # ========= 5) 随机采样 =========
+                if finding_token_ids_list:
+                    num_findings = len(finding_token_ids_list)
+                    num_to_sample = random.randint(1, num_findings)
+                    sampled_indices_map = set(random.sample(range(num_findings), num_to_sample))
+
+                    for idx in range(num_findings):
+                        cur_token_ids = finding_token_ids_list[idx]
+                        if idx in sampled_indices_map:
+                            sampled_finding_token_ids.extend(cur_token_ids)
+                        else:
+                            remaining_finding_token_ids.extend(cur_token_ids)
+
+                    if not remaining_finding_token_ids:
+                        remaining_finding_token_ids = sampled_finding_token_ids.copy()
+        # if len(sampled_finding_token_ids) == 0:
+        #     sampled_finding_token_ids = torch.empty(0, dtype=torch.long)
+        # else:
+        #     sampled_finding_token_ids = torch.tensor(sampled_finding_token_ids, dtype=torch.long)
+
+        # if len(remaining_finding_token_ids) == 0:
+        #     remaining_finding_token_ids = torch.empty(0, dtype=torch.long)
+        # else:
+        #     remaining_finding_token_ids = torch.tensor(remaining_finding_token_ids, dtype=torch.long)
+        # 输出：token ids（不是索引）
+        data_dict["sampled_finding_token_ids"] = sampled_finding_token_ids
+        data_dict["remaining_finding_token_ids"] = remaining_finding_token_ids
+        data_dict["all_finding_token_ids"] = all_finding_token_ids
         if isinstance(i, int):
-            data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
+            data_dict = dict(
+                input_ids=data_dict["input_ids"][0], 
+                labels=data_dict["labels"][0],
+                sampled_finding_token_ids=sampled_finding_token_ids,
+                remaining_finding_token_ids=remaining_finding_token_ids,
+                all_finding_token_ids=all_finding_token_ids
+            )
+
+        # if isinstance(i, int):
+        #     data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
 
         # image exist in the data
         if "image" in self.list_data_dict[i]:
@@ -1571,9 +1737,23 @@ class DataCollatorForSupervisedDataset(object):
         if "image" in instances[0]:
             images = [instance["image"] for instance in instances]
 
-            batch["image_sizes"] = [im[1] for im_list in images for im in im_list]
-            batch["modalities"] = [im[2] for im_list in images for im in im_list]
-            images = [im[0] for im_list in images for im in im_list]
+            # 添加保护性检查，避免空列表导致 IndexError
+            image_sizes = []
+            modalities = []
+            processed_images = []
+            
+            for im_list in images:
+                for im in im_list:
+                    if isinstance(im, (list, tuple)) and len(im) >= 3:
+                        processed_images.append(im[0])
+                        image_sizes.append(im[1])
+                        modalities.append(im[2])
+                    else:
+                        rank0_print(f"Warning: Unexpected image format: {type(im)}, length: {len(im) if hasattr(im, '__len__') else 'N/A'}")
+            
+            batch["image_sizes"] = image_sizes
+            batch["modalities"] = modalities
+            images = processed_images
 
             # if all(x is not None and x.shape == images[0].shape for x in images):
                 # Image: (N, P, C, H, W)
@@ -1585,6 +1765,10 @@ class DataCollatorForSupervisedDataset(object):
         if "prompt" in instances[0]:
             batch["prompts"] = [instance["prompt"] for instance in instances]
 
+        if "sampled_finding_token_ids" in instances[0]:
+            batch["sampled_finding_token_ids"] = [instance["sampled_finding_token_ids"] for instance in instances]
+            batch["remaining_finding_token_ids"] = [instance["remaining_finding_token_ids"] for instance in instances]
+            batch["all_finding_token_ids"] = [instance["all_finding_token_ids"] for instance in instances]
         return batch
 
 
@@ -1628,6 +1812,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             model_args.mm_spatial_pool_out_channels is not None,
             model_args.mm_spatial_pool_mode is not None,
             model_args.mm_resampler_type is not None,
+            model_args.stage is not None,
+            model_args.length_pred_len is not None,         
         ]
     ):
         cfg_pretrained = AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
@@ -1658,7 +1844,10 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
     if model_args.mm_spatial_pool_mode is not None:
         overwrite_config["mm_spatial_pool_mode"] = model_args.mm_spatial_pool_mode
-
+    if model_args.stage is not None:
+        overwrite_config["stage"] = model_args.stage 
+    if model_args.length_pred_len is not None:
+        overwrite_config["length_pred_len"] = model_args.length_pred_len
     if overwrite_config:
         assert cfg_pretrained is not None, "cfg_pretrained is None"
 
@@ -1718,7 +1907,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 low_cpu_mem_usage=False,
                 **customized_kwargs,
             )
-        elif "qwen" in model_args.model_name_or_path.lower():
+        elif "llada" in model_args.model_name_or_path.lower():
             # if "moe" in model_args.model_name_or_path.lower() or "A14B" in model_args.model_name_or_path:
             #     model = LlavaQwenMoeForCausalLM.from_pretrained(
             #         model_args.model_name_or_path,
@@ -1732,7 +1921,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
             #     deepspeed.utils.set_z3_leaf_modules(model, [Qwen2MoeSparseMoeBlock])
             # else:
-            model = LlavaQwen3ModelLM.from_pretrained(
+            model = LlavaLLaDAModelLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
@@ -1749,8 +1938,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 low_cpu_mem_usage=False,
                 **customized_kwargs,
             )
-        elif "llada" in model_args.model_name_or_path.lower():
-            model = LlavaLLaDAModelLM.from_pretrained(
+        elif "qwen" in model_args.model_name_or_path.lower():
+            model = LlavaQwen3ModelLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
@@ -1811,7 +2000,52 @@ def train(attn_implementation=None):
         )
 
     model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
-# ========================== 插入开始 ==========================
+    
+    if hasattr(model_args, 'stage') and model_args.stage == 3:
+        # 检查正确的属性名: length_discriminator (而不是 length_head)
+        if hasattr(model, 'length_discriminator'):
+            rank0_print("\n" + "="*80)
+            rank0_print("[Stage3] 检测到 length_discriminator，正在初始化...")
+            
+            # 使用 DeepSpeed Zero-3 的 GatheredParameters 上下文来正确访问参数
+            from deepspeed import zero
+            
+            std = model.config.initializer_range if hasattr(model.config, 'initializer_range') else 0.02
+            
+            # 收集所有 length_discriminator 的参数用于初始化
+            length_disc_params = list(model.length_discriminator.parameters())
+            
+            # 在 GatheredParameters 上下文中初始化和访问权重
+            with zero.GatheredParameters(length_disc_params, modifier_rank=0):
+                if training_args.local_rank == 0 or training_args.local_rank == -1:
+                    # 只在 rank 0 上初始化 length_discriminator 的所有参数
+                    for name, param in model.length_discriminator.named_parameters():
+                        if 'weight' in name:
+                            param.data.normal_(mean=0.0, std=std)
+                        elif 'bias' in name:
+                            param.data.zero_()
+                    
+                    # 打印 length_head 的统计信息
+                    length_head_weight = model.length_discriminator.length_head.weight
+                    weight_mean = length_head_weight.data.mean().item()
+                    weight_std = length_head_weight.data.std().item()
+                    weight_min = length_head_weight.data.min().item()
+                    weight_max = length_head_weight.data.max().item()
+                    
+                    rank0_print(f"[Stage3] length_discriminator.length_head 权重统计:")
+                    rank0_print(f"  - Shape: {length_head_weight.shape}")
+                    rank0_print(f"  - Mean: {weight_mean:.6f}")
+                    rank0_print(f"  - Std: {weight_std:.6f}")
+                    rank0_print(f"  - Min: {weight_min:.6f}")
+                    rank0_print(f"  - Max: {weight_max:.6f}")
+                    rank0_print(f"[Stage3] length_discriminator 总参数量: {sum(p.numel() for p in model.length_discriminator.parameters()):,}")
+            
+            rank0_print(f"[Stage3] length_discriminator 初始化完成！")
+            rank0_print("="*80 + "\n")
+        else:
+            rank0_print(f"[WARNING] stage=3 但模型没有 length_discriminator 属性！")
+    
+
     rank0_print("\n" + "!"*50)
     rank0_print(f"!!! [DEBUG] 模型实际加载路径: {model.config._name_or_path}")
     rank0_print(f"!!! [DEBUG] 模型Python类名: {type(model).__name__}")
@@ -2026,11 +2260,35 @@ def train(attn_implementation=None):
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
                         if param.dtype is not None and (torch.is_floating_point(param) or torch.is_complex(param)):
                            param.requires_grad_(True)
+            
+            # Stage 3: 自动解冻 length_discriminator（用于 length prediction 训练）
+            if hasattr(model_args, 'stage') and model_args.stage == 3:
+                if hasattr(model, 'length_discriminator'):
+                    rank0_print("[Stage3] 解冻 length_discriminator 参数...")
+                    for p in model.length_discriminator.parameters():
+                        if p.dtype is not None and (torch.is_floating_point(p) or torch.is_complex(p)):
+                            p.requires_grad = True
+                    trainable_params = sum(p.numel() for p in model.length_discriminator.parameters() if p.requires_grad)
+                    rank0_print(f"[Stage3] length_discriminator 参数已设置为可训练 ({trainable_params:,} 参数)")
+                else:
+                    rank0_print(f"[WARNING] stage=3 但模型没有 length_discriminator，请检查模型定义！")
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
         rank0_print(f"Total parameters: ~{total_params/1e6:.2f} MB)")
         rank0_print(f"Trainable parameters: ~{trainable_params/1e6:.2f} MB)")
+        rank0_print(f"Trainable parameters (exact): {trainable_params:,} parameters")
+        
+        # 列出所有可训练的参数
+        trainable_param_names = [name for name, p in model.named_parameters() if p.requires_grad]
+        if trainable_param_names:
+            rank0_print(f"Trainable parameter names ({len(trainable_param_names)} total):")
+            for name in trainable_param_names:
+                param = dict(model.named_parameters())[name]
+                numel = param.ds_numel if hasattr(param, "ds_numel") else param.numel()
+                rank0_print(f"  - {name}: {numel:,} params")
+        else:
+            rank0_print("WARNING: No trainable parameters found!")
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
@@ -2086,3 +2344,4 @@ def train(attn_implementation=None):
 
 if __name__ == "__main__":
     train()
+

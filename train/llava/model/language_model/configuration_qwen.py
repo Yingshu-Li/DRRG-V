@@ -15,7 +15,6 @@ class Qwen3Config(PretrainedConfig):
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
 
-
     Args:
         vocab_size (`int`, *optional*, defaults to 151936):
             Vocabulary size of the Qwen3 model. Defines the number of different tokens that can be represented by the
@@ -158,6 +157,8 @@ class Qwen3Config(PretrainedConfig):
         max_window_layers=28,
         layer_types=None,
         attention_dropout=0.0,
+        stage=2,
+        length_pred_len=300,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -185,6 +186,11 @@ class Qwen3Config(PretrainedConfig):
         self._rope_scaling_validation()
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        
+        # Stage3 length prediction parameters
+        self.stage = stage
+        self.length_pred_len = length_pred_len
+        
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
         # if self.rope_scaling is not None and "type" in self.rope_scaling:

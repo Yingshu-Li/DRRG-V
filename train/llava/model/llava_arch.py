@@ -97,7 +97,19 @@ class LlavaMetaModel:
                     p.requires_grad = True
         self.config.use_mm_proj = True
         self.config.mm_projector_type = getattr(model_args, "mm_projector_type", "linear")
-        self.config.mm_hidden_size = getattr(vision_resampler, "hidden_size", vision_tower.hidden_size)
+        # 修复：确保从正确的 vision_resampler 对象获取 hidden_size
+        # 如果 vision_resampler 是列表，取第一个元素（如果列表非空）
+        if isinstance(vision_resampler, list):
+            resampler_for_config = vision_resampler[0] if len(vision_resampler) > 0 else None
+        else:
+            resampler_for_config = vision_resampler
+        
+        if resampler_for_config is not None:
+            self.config.mm_hidden_size = getattr(resampler_for_config, "hidden_size", vision_tower.hidden_size)
+        else:
+            self.config.mm_hidden_size = vision_tower.hidden_size
+            rank0_print(f"Warning: vision_resampler is empty, using vision_tower.hidden_size for mm_hidden_size")
+
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.mm_patch_merge_type = mm_patch_merge_type
@@ -131,10 +143,65 @@ class LlavaMetaModel:
             def get_w(weights, keyword):
                 return {k.split(keyword + ".")[1]: v for k, v in weights.items() if keyword in k}
 
-            incompatible_keys = self.mm_projector.load_state_dict(get_w(mm_projector_weights, "mm_projector"))
-            rank0_print(f"Loaded mm projector weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
-            incompatible_keys = self.vision_resampler.load_state_dict(get_w(mm_projector_weights, "vision_resampler"), strict=False)
-            rank0_print(f"Loaded vision resampler weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
+            # 检查权重文件中是否包含 mm_projector 和 vision_resampler
+            has_mm_projector = any("mm_projector" in k for k in mm_projector_weights.keys())
+            has_vision_resampler = any("vision_resampler" in k for k in mm_projector_weights.keys())
+            
+            rank0_print(f"Checkpoint contains mm_projector: {has_mm_projector}, vision_resampler: {has_vision_resampler}")
+
+            # 处理 DeepSpeed Zero-3：使用 GatheredParameters 上下文
+            try:
+                from deepspeed import zero
+                from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+                mm_projector_params = list(self.mm_projector.parameters())
+                use_deepspeed_zero3 = len(mm_projector_params) > 0 and hasattr(mm_projector_params[0], 'ds_id')
+            except:
+                use_deepspeed_zero3 = False
+            
+            if use_deepspeed_zero3:
+                # DeepSpeed Zero-3: 需要在 GatheredParameters 上下文中加载权重
+                if has_mm_projector:
+                    with zero.GatheredParameters(list(self.mm_projector.parameters()), modifier_rank=0):
+                        incompatible_keys = self.mm_projector.load_state_dict(get_w(mm_projector_weights, "mm_projector"))
+                    rank0_print(f"Loaded mm projector weights from {pretrain_mm_mlp_adapter} (DeepSpeed Zero-3). Incompatible keys: {incompatible_keys}")
+                
+                # 只有在权重文件包含 vision_resampler 时才加载
+                if has_vision_resampler:
+                    # 处理 vision_resampler（可能是列表）
+                    if isinstance(self.vision_resampler, list):
+                        if len(self.vision_resampler) == 0:
+                            rank0_print(f"Skip loading vision_resampler weights (vision_resampler is empty list)")
+                        else:
+                            resampler_params = list(self.vision_resampler[0].parameters())
+                            with zero.GatheredParameters(resampler_params, modifier_rank=0):
+                                incompatible_keys = self.vision_resampler[0].load_state_dict(get_w(mm_projector_weights, "vision_resampler"), strict=False)
+                            rank0_print(f"Loaded vision resampler weights from {pretrain_mm_mlp_adapter} (DeepSpeed Zero-3). Incompatible keys: {incompatible_keys}")
+                    else:
+                        resampler_params = list(self.vision_resampler.parameters())
+                        with zero.GatheredParameters(resampler_params, modifier_rank=0):
+                            incompatible_keys = self.vision_resampler.load_state_dict(get_w(mm_projector_weights, "vision_resampler"), strict=False)
+                        rank0_print(f"Loaded vision resampler weights from {pretrain_mm_mlp_adapter} (DeepSpeed Zero-3). Incompatible keys: {incompatible_keys}")
+                else:
+                    rank0_print(f"Skip loading vision_resampler weights (not found in checkpoint)")
+            else:
+                # 非 DeepSpeed Zero-3：正常加载
+                if has_mm_projector:
+                    incompatible_keys = self.mm_projector.load_state_dict(get_w(mm_projector_weights, "mm_projector"))
+                    rank0_print(f"Loaded mm projector weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
+                
+                # 只有在权重文件包含 vision_resampler 时才加载
+                if has_vision_resampler:
+                    if isinstance(self.vision_resampler, list):
+                        if len(self.vision_resampler) == 0:
+                            rank0_print(f"Skip loading vision_resampler weights (vision_resampler is empty list)")
+                        else:
+                            incompatible_keys = self.vision_resampler[0].load_state_dict(get_w(mm_projector_weights, "vision_resampler"), strict=False)
+                            rank0_print(f"Loaded vision resampler weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
+                    else:
+                        incompatible_keys = self.vision_resampler.load_state_dict(get_w(mm_projector_weights, "vision_resampler"), strict=False)
+                        rank0_print(f"Loaded vision resampler weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
+                else:
+                    rank0_print(f"Skip loading vision_resampler weights (not found in checkpoint)")
     
 
 

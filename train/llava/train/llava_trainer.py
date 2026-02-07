@@ -113,10 +113,11 @@ def get_modality_length_grouped_indices(lengths, batch_size, world_size, generat
     mm_megabatches = [mm_shuffle[i : i + megabatch_size] for i in range(0, len(mm_shuffle), megabatch_size)]
     lang_megabatches = [lang_shuffle[i : i + megabatch_size] for i in range(0, len(lang_shuffle), megabatch_size)]
 
-    last_mm = mm_megabatches[-1]
-    last_lang = lang_megabatches[-1]
+    # 修复：检查列表是否为空，避免 IndexError
+    last_mm = mm_megabatches[-1] if len(mm_megabatches) > 0 else []
+    last_lang = lang_megabatches[-1] if len(lang_megabatches) > 0 else []
     additional_batch = last_mm + last_lang
-    megabatches = mm_megabatches[:-1] + lang_megabatches[:-1]
+    megabatches = (mm_megabatches[:-1] if len(mm_megabatches) > 0 else []) + (lang_megabatches[:-1] if len(lang_megabatches) > 0 else [])
     megabatch_indices = torch.randperm(len(megabatches), generator=generator)
     megabatches = [megabatches[i] for i in megabatch_indices]
 
@@ -179,10 +180,11 @@ def get_modality_length_grouped_indices_auto(lengths, batch_size, world_size, ge
     mm_megabatches = [mm_shuffle[i : i + megabatch_size] for i in range(0, len(mm_shuffle), megabatch_size)]
     lang_megabatches = [lang_shuffle[i : i + megabatch_size] for i in range(0, len(lang_shuffle), megabatch_size)]
 
-    last_mm = mm_megabatches[-1]
-    last_lang = lang_megabatches[-1]
+    # 修复：检查列表是否为空，避免 IndexError
+    last_mm = mm_megabatches[-1] if len(mm_megabatches) > 0 else []
+    last_lang = lang_megabatches[-1] if len(lang_megabatches) > 0 else []
     additional_batch = last_mm + last_lang
-    megabatches = mm_megabatches[:-1] + lang_megabatches[:-1]
+    megabatches = (mm_megabatches[:-1] if len(mm_megabatches) > 0 else []) + (lang_megabatches[:-1] if len(lang_megabatches) > 0 else [])
     megabatch_indices = torch.randperm(len(megabatches), generator=generator)
     megabatches = [megabatches[i] for i in megabatch_indices]
 
