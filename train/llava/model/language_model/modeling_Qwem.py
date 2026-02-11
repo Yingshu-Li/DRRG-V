@@ -842,7 +842,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
     @torch.no_grad()
     def generate_with_embeds(self, inputs_embeds, steps=128, gen_length=128, block_length=128, temperature=0.,
-        cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None, use_length_prediction=False, stopping_criteria=None, generation_suffix=None, **kwargs):
+        cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None, use_length_prediction=True, stopping_criteria=None, generation_suffix=None, **kwargs):
         '''
         Args:
             inputs_embeds: A tensor of shape (1, l, d).
@@ -1667,7 +1667,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             eos_logits = self.length_discriminator(
                 hidden_states, 
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                position_ids=position_ids_new,
                 cache_position=cache_position
             )
             eos_logits = eos_logits.float()

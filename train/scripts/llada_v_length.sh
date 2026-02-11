@@ -40,13 +40,13 @@ VISION_MODEL_VERSION_CLEAN="${VISION_MODEL_VERSION//\//_}"
 
 PROMPT_VERSION="qwen"
 
-BASE_RUN_NAME="llada_v_length2"
+BASE_RUN_NAME="llada_v_length3"
 echo "BASE_RUN_NAME: ${BASE_RUN_NAME}"
 
 ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_node} --master_addr=${MASTER_ADDR} --master_port ${MASTER_PORT} --node_rank=${RANK} \
     llava/train/train_mem.py \
     --deepspeed scripts/zero3.json \
-    --model_name_or_path "/mnt/sda/shaoyang/model/LLaDA/LLaDA-V/train/exp/llada_v_finetune7" \
+    --model_name_or_path "/mnt/sda/shaoyang/model/LLaDA_Qwen_length/LLaDA-V-Qwen/train/exp/llada_v_core_random/checkpoint-50775" \
     --version ${PROMPT_VERSION} \
     --data_path "/mnt/sda/shaoyang/model/LLaDA/LLaDA-V/data/train_llava_llada.json" \
     --image_folder "/mnt/sdb/datasets/mimic_original/2.0.0/files" \

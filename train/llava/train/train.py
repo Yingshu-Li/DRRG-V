@@ -1921,7 +1921,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
             #     deepspeed.utils.set_z3_leaf_modules(model, [Qwen2MoeSparseMoeBlock])
             # else:
-            model = LlavaLLaDAModelLM.from_pretrained(
+            model = LlavaQwen3ModelLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,

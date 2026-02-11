@@ -7,7 +7,7 @@ mkdir -p "${HF_HOME}"
 # Define multiple model paths
 # Ablation Models
 MODEL_PATHS=(
-    "/mnt/sda/shaoyang/model/LLaDA_Qwen_length/LLaDA-V-Qwen/train/exp/llada_v_core_random/checkpoint-16925"
+    "/mnt/sda/shaoyang/model/LLaDA_Qwen_length/LLaDA-V-Qwen/train/exp/llada_v_length3/checkpoint-16924"
 )
 
 # Set output path
@@ -56,7 +56,7 @@ for model_path in "${MODEL_PATHS[@]}"; do
                 ;;
             mimic_cxr)
                 # Medical report generation: longer output, use semi-autoregressive
-                GEN_KWARGS='{"temperature":0,"cfg":0,"remasking":"low_confidence","gen_length":72,"block_length":72,"gen_steps":72,"think_mode":"no_think"}'
+                GEN_KWARGS='{"temperature":0,"cfg":0,"remasking":"low_confidence","gen_length":400,"block_length":400,"gen_steps":72,"think_mode":"no_think"}'
                 ;;
             *)
                 GEN_KWARGS='{"temperature":0,"cfg":0,"remasking":"low_confidence","gen_length":2,"block_length":1,"gen_steps":2,"think_mode":"no_think"}'
