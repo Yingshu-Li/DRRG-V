@@ -1167,23 +1167,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             p_mask_inv = 1.0 - p_mask
             p_mask = torch.cat([p_mask, p_mask_inv], dim=0)
             noisy_data_length = noisy_data_length.repeat(2, 1)
-            if conversation_ids is not None: 
-                conversation_mask = self._build_conversation_mask_optimized(conversation_ids)
-                if attention_mask is not None:
-                    # 1. Dimension expansion
-                    attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, length) -> (batch, 1, 1, length)
-                    attention_mask = attention_mask.expand_as(conversation_mask) # (batch, 1, 1, length) -> (batch, 1, length, length)
-                    # 2. Mask combination (element-wise multiplication)
-                    combined_mask = conversation_mask * attention_mask
-                else:
-                    # If attention_mask is None, directly use conversation_mask
-                    combined_mask = conversation_mask 
-                attention_mask = combined_mask
 
+            # MDM uses full bidirectional attention (no causal/padding mask)
             # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
             outputs = self.model(
                 input_ids=input_ids,
-                attention_mask=attention_mask,
+                attention_mask=None,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 inputs_embeds=noisy_embeds,

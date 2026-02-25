@@ -83,11 +83,11 @@ class LlavaQwen3ModelLM(Qwen3ForCausalLM, LlavaMetaForCausalLM):
         dpo_forward: Optional[bool] = None,
         cache_position=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        if inputs_embeds is None and attention_mask is not None:
-            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels, conversation_ids) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes, is_llada=True)
-        elif inputs_embeds is None:
+        if inputs_embeds is None:
             (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes)
-            conversation_ids = None
+        # MDM uses full bidirectional attention, no attention mask needed (following dLLM convention)
+        attention_mask = None
+        conversation_ids = None
         if dpo_forward:
             outputs = self.model(
                 input_ids=input_ids,

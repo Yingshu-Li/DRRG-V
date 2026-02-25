@@ -71,7 +71,7 @@ playground/*.json
 mlx_configs/
 data_processing/
 # demo/
-
+exp/
 # *test*
 test.py
 demo/
