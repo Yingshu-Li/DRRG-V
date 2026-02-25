@@ -580,6 +580,19 @@ def preprocess_gemma(sources: List[List[Dict[str, str]]], tokenizer: transformer
     )
 
 
+def clean_report_text(text: str) -> str:
+    """Clean MIMIC-CXR report text by removing formatting artifacts."""
+    text = re.sub(r'\n+', ' ', text)
+    text = re.sub(r'[_-]+', ' ', text)
+    text = re.sub(r'\(___, __, __\)', '', text)
+    text = re.sub(r'---, ---, ---', '', text)
+    text = re.sub(r'\(__, __, ___\)', '', text)
+    text = re.sub(r'[_-]+', ' ', text)
+    text = re.sub(r'[^\w\s.,:;()\-]', '', text)
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
+
+
 def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_image: bool = False, max_len=2048, system_message: str = "You are a helpful assistant.") -> Dict:
     # roles = {"human": "<|im_start|>user", "gpt": "<|im_start|>assistant"}
     roles = {"human": "user", "gpt": "assistant"}
@@ -628,7 +641,10 @@ def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
                 content = conv["value"]
 
             role =  roles.get(role, role)
-            
+            # Clean assistant response text (radiology reports)
+            if role == "assistant":
+                content = clean_report_text(content)
+
             conv = [{"role" : role, "content" : content}]
             encode_id = tokenizer.apply_chat_template(conv)
             input_id += encode_id
@@ -805,7 +821,10 @@ def preprocess_llada(
                 content = conv["value"]
 
             role =  roles.get(role, role)
-            
+            # Clean assistant response text (radiology reports)
+            if role == "assistant":
+                content = clean_report_text(content)
+
             conv = [{"role" : role, "content" : content}]
             # First is bos token we don't need here
             encode_id = tokenizer.apply_chat_template(conv)[1:]
@@ -814,7 +833,7 @@ def preprocess_llada(
                 target += [IGNORE_INDEX] * len(encode_id)
             else:
                 target += encode_id
-                    
+
         assert len(input_id) == len(target), f"{len(input_id)} != {len(target)}"
         for idx, encode_id in enumerate(input_id):
             if encode_id in unmask_tokens_idx:

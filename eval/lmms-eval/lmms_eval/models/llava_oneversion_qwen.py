@@ -29,6 +29,19 @@ from lmms_eval.models.model_utils.load_video import read_video_pyav
 # Suppress warnings
 warnings.filterwarnings("ignore")
 
+
+def clean_report_text(text: str) -> str:
+    """Clean MIMIC-CXR report text by removing formatting artifacts."""
+    text = re.sub(r'\n+', ' ', text)
+    text = re.sub(r'[_-]+', ' ', text)
+    text = re.sub(r'\(___, __, __\)', '', text)
+    text = re.sub(r'---, ---, ---', '', text)
+    text = re.sub(r'\(__, __, ___\)', '', text)
+    text = re.sub(r'[_-]+', ' ', text)
+    text = re.sub(r'[^\w\s.,:;()\-]', '', text)
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
+
 # Configure logging
 eval_logger = logging.getLogger("lmms-eval")
 
@@ -592,7 +605,8 @@ class Llava_OneVersion_Qwen(lmms):
                 gen_kwargs["steps"] = gen_kwargs["gen_steps"]
 
             input_ids_list = [tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt") for prompt in question_input]
-            pad_token_ids = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            # Use EOS token for padding (consistent with MDM training convention)
+            pad_token_ids = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else self.tokenizer.pad_token_id
             input_ids = self.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_ids).to(self.device)
             attention_masks = input_ids.ne(pad_token_ids).to(self.device)
 
@@ -637,6 +651,7 @@ class Llava_OneVersion_Qwen(lmms):
                     # cont = self.model.generate(qwen_input_ids, pad_token_id=pad_token_ids, images=image_tensor, use_cache=self.use_cache, **gen_kwargs)
 
                 text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
+                text_outputs = [clean_report_text(output) for output in text_outputs]
                 text_outputs = [output[:-1] if output.endswith('.') else output for output in text_outputs]
                 num_tokens += (cont != self.tokenizer.eos_token_id).sum()
 
@@ -856,6 +871,7 @@ class Llava_OneVersion_Qwen(lmms):
                         # cont = self.model.generate(qwen_input_ids, pad_token_id=pad_token_ids, images=image_tensor, use_cache=self.use_cache, **gen_kwargs)
 
                     text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
+                    text_outputs = [clean_report_text(output) for output in text_outputs]
                 except Exception as e:
                     raise e
 
