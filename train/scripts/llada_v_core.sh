@@ -1,7 +1,8 @@
 export OMP_NUM_THREADS=8
 export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=3
-export NCCL_SOCKET_IFNAME=enp1s0f1np1
+export CUDA_VISIBLE_DEVICES=2,3
+export NCCL_SOCKET_IFNAME=eno1
 export NCCL_DEBUG=WARN
 export NCCL_DEBUG_SUBSYS=ALL
 export HF_HOME="/mnt/sdb/pretrained_models/Qwen3-0.6B-diffusion"
@@ -33,7 +34,7 @@ echo "num_node ${num_node}"
 
 LLM_VERSION="dllm-collection/Qwen3-0.6B-diffusion-mdlm-v0.1"
 LLM_VERSION_CLEAN="${LLM_VERSION//\//_}"
-VISION_MODEL_VERSION=/mnt/sdb/pretrained_models/siglip2-so400m-patch14-384
+VISION_MODEL_VERSION="/mnt/sdc/shaoyang/LLaDA-V/DRRG/siglip2-so400m-patch14-384"
 VISION_MODEL_VERSION_CLEAN="${VISION_MODEL_VERSION//\//_}"
 
 ############### Finetune ################
@@ -46,17 +47,17 @@ echo "BASE_RUN_NAME: ${BASE_RUN_NAME}"
 ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_node} --master_addr=${MASTER_ADDR} --master_port ${MASTER_PORT} --node_rank=${RANK} \
     llava/train/train_mem.py \
     --deepspeed scripts/zero3.json \
-    --model_name_or_path "/mnt/sdb/pretrained_models/Qwen3-0.6B-diffusion" \
+    --model_name_or_path "/mnt/sdc/shaoyang/LLaDA-V/DRRG/qwen-dllm" \
     --version ${PROMPT_VERSION} \
-    --data_path "/mnt/sda/shaoyang/model/LLaDA_Qwen_length/LLaDA-V-Qwen/train/playground/train_llava_llada_with_core_findings.json" \
-    --image_folder "/mnt/sdb/datasets/mimic_original/2.0.0/files" \
+    --data_path "/mnt/sdc/shaoyang/DRRG/data/llada_with_chexbert_labels.json" \
+    --image_folder "/mnt/sda/datasets/mimic_original/2.0.0/files" \
     --video_folder "" \
     --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_language_model" \
     --mm_vision_tower_lr=2e-6 \
     --vision_tower ${VISION_MODEL_VERSION} \
     --mm_projector_type mlp2x_gelu \
     --stage 1 \
-    --pretrain_mm_mlp_adapter "/mnt/sda/shaoyang/model/LLaDA/LLaDA-V/train/llada_v_prepare/mm_projector.bin" \
+    --pretrain_mm_mlp_adapter "/mnt/sdc/shaoyang/LLaDA-V/DRRG/train/llada_v_prepare/mm_projector.bin" \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
@@ -68,9 +69,9 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --run_name $BASE_RUN_NAME \
     --output_dir "exp/$BASE_RUN_NAME" \
     --num_train_epochs 3 \
-    --per_device_train_batch_size 2 \
+    --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps 2 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 5000 \

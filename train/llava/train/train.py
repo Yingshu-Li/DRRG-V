@@ -1499,7 +1499,7 @@ class LazySupervisedDataset(Dataset):
             prompt = None
 
         core_findings = self.list_data_dict[i].get("core_findings", [])
-
+        chexbert_labels = self.list_data_dict[i].get("chexbert_labels", [])
         sampled_finding_token_ids = []
         remaining_finding_token_ids = []
         all_finding_token_ids = []
@@ -1651,13 +1651,15 @@ class LazySupervisedDataset(Dataset):
         data_dict["sampled_finding_token_ids"] = sampled_finding_token_ids
         data_dict["remaining_finding_token_ids"] = remaining_finding_token_ids
         data_dict["all_finding_token_ids"] = all_finding_token_ids
+        data_dict["chexbert_labels"] = chexbert_labels
         if isinstance(i, int):
             data_dict = dict(
                 input_ids=data_dict["input_ids"][0], 
                 labels=data_dict["labels"][0],
                 sampled_finding_token_ids=sampled_finding_token_ids,
                 remaining_finding_token_ids=remaining_finding_token_ids,
-                all_finding_token_ids=all_finding_token_ids
+                all_finding_token_ids=all_finding_token_ids,
+                chexbert_labels=chexbert_labels,
             )
 
         # if isinstance(i, int):
@@ -1769,6 +1771,11 @@ class DataCollatorForSupervisedDataset(object):
             batch["sampled_finding_token_ids"] = [instance["sampled_finding_token_ids"] for instance in instances]
             batch["remaining_finding_token_ids"] = [instance["remaining_finding_token_ids"] for instance in instances]
             batch["all_finding_token_ids"] = [instance["all_finding_token_ids"] for instance in instances]
+
+        if "chexbert_labels" in instances[0]:
+            chexbert_labels = [instance["chexbert_labels"] for instance in instances]
+            batch["chexbert_labels"] = torch.tensor(chexbert_labels, dtype=torch.float32)
+            
         return batch
 
 
@@ -2319,7 +2326,16 @@ def train(attn_implementation=None):
 
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+        # Allow --resume_from_checkpoint False to skip ZeRO optimizer state loading
+        # (e.g. when changing world size). Defaults to True to preserve original behavior.
+        resume = training_args.resume_from_checkpoint
+        if resume is None:
+            resume = True
+        elif isinstance(resume, str) and resume.lower() == "false":
+            resume = False
+        elif isinstance(resume, str) and resume.lower() == "true":
+            resume = True
+        trainer.train(resume_from_checkpoint=resume)
     else:
         trainer.train()
     trainer.save_state()

@@ -1,13 +1,14 @@
 # export HF_HOME="/mnt/sdb/pretrained_models/LLaDA"
 export HUGGINGFACE_HUB_CACHE="${HF_HOME}/hub"
 export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
+export CUDA_VISIBLE_DEVICES=2,3
 ## Ensure local lmms-eval package is on PYTHONPATH so `-m lmms_eval` works
 export PYTHONPATH=$(pwd)/lmms-eval:$(pwd):$PYTHONPATH
 mkdir -p "${HF_HOME}"
 # Define multiple model paths
 # Ablation Models
 MODEL_PATHS=(
-    "/mnt/sda/shaoyang/model/LLaDA_Qwen_length/LLaDA-V-Qwen/train/exp/llada_v_length3/checkpoint-16924"
+    "/mnt/sdc/shaoyang/DRRG/train/exp/llada_v_core_random/checkpoint-8462"
 )
 
 # Set output path
@@ -56,7 +57,7 @@ for model_path in "${MODEL_PATHS[@]}"; do
                 ;;
             mimic_cxr)
                 # Medical report generation: longer output, use semi-autoregressive
-                GEN_KWARGS='{"temperature":0,"cfg":0,"remasking":"low_confidence","gen_length":400,"block_length":400,"gen_steps":72,"think_mode":"no_think"}'
+                GEN_KWARGS='{"temperature":0,"cfg":0,"remasking":"low_confidence","gen_length":72,"block_length":72,"gen_steps":72,"think_mode":"no_think"}'
                 ;;
             *)
                 GEN_KWARGS='{"temperature":0,"cfg":0,"remasking":"low_confidence","gen_length":2,"block_length":1,"gen_steps":2,"think_mode":"no_think"}'
@@ -180,7 +181,7 @@ for CURRENT_TASK_STRING in "${TASK_QUEUE[@]}"; do
     echo "Starting task ($COUNT / $TOTAL_TASKS): Evaluating $MODEL_PATH_LAST on $TASK_NAME using ALL $TOTAL_GPUS GPUs"
 
     
-    CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 accelerate launch --num_processes=$TOTAL_GPUS --main_process_port 29501 -m lmms_eval \
+    CUDA_VISIBLE_DEVICES=2,3 PYTHONUNBUFFERED=1 accelerate launch --num_processes=$TOTAL_GPUS --main_process_port 29501 -m lmms_eval \
         --model "$CURRENT_MODEL" \
         ${CURRENT_GEN_KWARGS:+--gen_kwargs="$CURRENT_GEN_KWARGS"} \
         --model_args "pretrained=$MODEL_PATH,conv_template=$CURRENT_CONV_TEMPLATE,model_name=$CURRENT_MODEL_NAME" \

@@ -14,8 +14,21 @@ import evaluate
 from loguru import logger as eval_logger
 
 # Image folder path for MIMIC-CXR images
-MIMIC_CXR_IMAGE_FOLDER = "/mnt/sdb/datasets/mimic_original/2.0.0/files"
+MIMIC_CXR_IMAGE_FOLDER = "/mnt/sda/datasets/mimic_original/2.0.0/files"
 
+def clean_text(text: str) -> str:
+    """
+    Perform basic cleanup of text by removing newlines, dashes, and some special patterns.
+    """
+    text = re.sub(r'\n+', ' ', text)
+    text = re.sub(r'[_-]+', ' ', text)
+    text = re.sub(r'\(___, __, __\)', '', text)
+    text = re.sub(r'---, ---, ---', '', text)
+    text = re.sub(r'\(__, __, ___\)', '', text)
+    text = re.sub(r'[_-]+', ' ', text)
+    text = re.sub(r'[^\w\s.,:;()\-]', '', text)
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
 
 def mimic_cxr_doc_to_visual(doc):
     """Extract image from document."""
@@ -93,61 +106,24 @@ def compute_bleu(
 
 def compute_rouge(predictions: List[str], references: List[str]) -> Dict[str, float]:
     """Compute ROUGE scores."""
-    from rouge_score import rouge_scorer
+    rouge_metric = evaluate.load("rouge")
     
-    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-    
-    rouge1_scores = []
-    rouge2_scores = []
-    rougeL_scores = []
-    
-    for pred, ref in zip(predictions, references):
-        if not pred or not ref:
-            continue
-        
-        scores = scorer.score(ref, pred)
-        rouge1_scores.append(scores['rouge1'].fmeasure)
-        rouge2_scores.append(scores['rouge2'].fmeasure)
-        rougeL_scores.append(scores['rougeL'].fmeasure)
+    result = rouge_metric.compute(predictions=predictions, references=references, use_stemmer=True)
     
     return {
-        'rouge_1': sum(rouge1_scores) / len(rouge1_scores) if rouge1_scores else 0,
-        'rouge_2': sum(rouge2_scores) / len(rouge2_scores) if rouge2_scores else 0,
-        'rouge_l': sum(rougeL_scores) / len(rougeL_scores) if rougeL_scores else 0,
+        'rouge_1': float(result['rouge1']),
+        'rouge_2': float(result['rouge2']),
+        'rouge_l': float(result['rougeL']),
     }
 
 
 def compute_meteor(predictions: List[str], references: List[str]) -> float:
     """Compute METEOR score."""
-    from nltk.translate.meteor_score import meteor_score
-    import nltk
+    meteor_metric = evaluate.load("meteor")
     
-    # Ensure nltk data is downloaded
-    try:
-        nltk.data.find('wordnet')
-    except LookupError:
-        nltk.download('wordnet', quiet=True)
-    try:
-        nltk.data.find('omw-1.4')
-    except LookupError:
-        nltk.download('omw-1.4', quiet=True)
+    result = meteor_metric.compute(predictions=predictions, references=references)
     
-    meteor_scores = []
-    
-    for pred, ref in zip(predictions, references):
-        pred_tokens = pred.lower().split()
-        ref_tokens = ref.lower().split()
-        
-        if len(pred_tokens) == 0 or len(ref_tokens) == 0:
-            continue
-        
-        try:
-            score = meteor_score([ref_tokens], pred_tokens)
-            meteor_scores.append(score)
-        except Exception as e:
-            eval_logger.warning(f"METEOR computation failed: {e}")
-    
-    return sum(meteor_scores) / len(meteor_scores) if meteor_scores else 0
+    return float(result['meteor'])
 
 
 # Global counter for debug printing
@@ -214,8 +190,8 @@ def mimic_cxr_aggregate_results(results: List[Dict]) -> float:
     if not results:
         return 0.0
     
-    predictions = [r["prediction"] for r in results]
-    references = [r["ground_truth"] for r in results]
+    predictions = [clean_text(r["prediction"]) for r in results]
+    references = [clean_text(r["ground_truth"]) for r in results]
     
     # Compute all metrics
     bleu_scores = compute_bleu(predictions, references)

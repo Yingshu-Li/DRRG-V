@@ -842,7 +842,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
     @torch.no_grad()
     def generate_with_embeds(self, inputs_embeds, steps=128, gen_length=128, block_length=128, temperature=0.,
-        cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None, use_length_prediction=True, stopping_criteria=None, generation_suffix=None, **kwargs):
+        cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None, use_length_prediction=False, stopping_criteria=None, generation_suffix=None, image_token_mask=None, **kwargs):
         '''
         Args:
             inputs_embeds: A tensor of shape (1, l, d).
@@ -913,7 +913,24 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             x_embeds[:, :inputs_embeds.shape[1]] = inputs_embeds.clone()
             if suffix_embeds is not None:
                 x_embeds[:, -suffix_len:] = suffix_embeds
-
+            # if image_token_mask is not None:
+            #     prompt_len = inputs_embeds.shape[1]
+            #     image_token_mask_full = torch.zeros((1, total_length), dtype=torch.bool,
+            #                                         device=inputs_embeds.device)
+            #     image_token_mask_full[:, :prompt_len] = image_token_mask
+            #     # Compute fused_feature once before the generation loop
+            #     outputs_pre = self.model(inputs_embeds=x_embeds)
+            #     hs_pre = outputs_pre.last_hidden_state
+            #     image_hidden = hs_pre * image_token_mask_full.unsqueeze(-1).to(hs_pre.dtype)
+            #     image_length = image_token_mask_full.float().sum(dim=1).clamp(min=1e-9)  # float32 to avoid bfloat16 precision loss
+            #     mean_hidden = image_hidden.sum(dim=1) / image_length
+            #     chexbert_logits = self.chexbert_head(mean_hidden)
+            #     chexbert_scores = torch.sigmoid(chexbert_logits)
+            #     concept_feature = torch.matmul(chexbert_scores, self.concept_table)
+            #     fused_feature = self.fuse_head(concept_feature).unsqueeze(1)  # (1, 1, d)
+            # else:
+            #     image_token_mask_full = None
+            #     fused_feature = None
             # Create a tracking tensor for token IDs for final output
             x = torch.full((1, total_length), mask_id, dtype=torch.long, device=inputs_embeds.device)
             if suffix_token_ids is not None:
@@ -984,13 +1001,13 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         
                         # Forward pass
                         outputs = self.model(inputs_embeds=combined_embeds)
-                        logits = self.lm_head(outputs[0]).float()
+                        logits = self.lm_head(outputs[0]).float()                       
                         
                         # Split and apply CFG
                         logits, un_logits = torch.chunk(logits, 2, dim=0)
                         logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                     else:
-                        # Forward pass
+                        # Forward pass (required every step as x_embeds changes)
                         outputs = self.model(inputs_embeds=x_embeds)
                         logits = self.lm_head(outputs[0]).float()
                     
@@ -1093,6 +1110,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         output_attentions: Optional[bool] = None,
         sampled_finding_token_ids: Optional[list] = None,
         remaining_finding_token_ids: Optional[list] = None,
+        concept_loss: Optional[float] = None,
         all_finding_token_ids: Optional[list] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -1280,6 +1298,20 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             )
 
             hidden_states = outputs.last_hidden_state
+            # image_mask = torch.cat([image_mask, image_mask], dim=0).to(hidden_states.dtype)  # shape (2*b, l, 1)
+            # image_hidden = hidden_states * image_mask
+            # # mask = attention_mask.unsqueeze(-1).float() 
+            # # mean_hidden = prompt_hidden.mean(dim=1)
+            # image_length = image_mask.sum(dim=1).clamp(min=1e-9)  # shape: (2*b, 1), avoid division by zero
+            # mean_hidden = (image_hidden.sum(dim=1) / image_length) # Match dtype with model weights
+            # chexbert_logits = self.chexbert_head(mean_hidden)
+            # chexbert_scores = torch.sigmoid(chexbert_logits)
+            # concept_loss = F.binary_cross_entropy(chexbert_scores, chexbert_labels, reduction='mean')
+            # print(f"[Concept Loss] {concept_loss.item():.4f}")
+            # concept_feature = torch.matmul(chexbert_scores, self.concept_table)
+            # fused_feature = self.fuse_head(concept_feature)
+            # fused_feature = fused_feature.unsqueeze(1)
+            # hidden_states = hidden_states + fused_feature * image_mask
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
             # slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
             # logits = self.lm_head(hidden_states[:, slice_indices, :])
@@ -1306,7 +1338,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 # token_loss = token_loss_noenv + token_loss_env
                 token_loss = token_loss
                 loss = torch.sum(token_loss / noisy_data_length) / labels.shape[0]
-
+                loss = loss + 0.5 * concept_loss
             if not return_dict:
                 output = (logits,) + outputs[1:]
                 return (loss,) + output if loss is not None else output

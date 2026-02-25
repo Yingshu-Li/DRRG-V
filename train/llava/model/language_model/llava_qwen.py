@@ -59,6 +59,10 @@ class LlavaQwen3ModelLM(Qwen3ForCausalLM, LlavaMetaForCausalLM):
 
         self.model = LlavaQwen3Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.chexbert_head = nn.Linear(1152, 14, bias=False)
+        self.concept_table = self.concept_table = nn.Parameter(torch.empty(14, 1152))
+        nn.init.trunc_normal_(self.concept_table, mean=0.0, std=0.02, a=-0.04, b=0.04)
+        self.fuse_head = nn.Linear(1152, 1152, bias=False) 
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -85,6 +89,7 @@ class LlavaQwen3ModelLM(Qwen3ForCausalLM, LlavaMetaForCausalLM):
         sampled_finding_token_ids: Optional[list] = None,
         remaining_finding_token_ids: Optional[list] = None,
         all_finding_token_ids: Optional[list] = None,
+        chexbert_labels: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         #Print batch size and sequence length for debugging
         if (not dist.is_initialized()) or dist.get_rank() == 0:
@@ -93,9 +98,9 @@ class LlavaQwen3ModelLM(Qwen3ForCausalLM, LlavaMetaForCausalLM):
             print(f"[DEBUG] model.forward bs={bs}, seqlen={seqlen}, has_images={images is not None}")
         if inputs_embeds is None and attention_mask is not None:
             # donate multi-dialogue 
-            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels, conversation_ids) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes, is_llada=True)
+            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels, conversation_ids, concept_loss) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes, is_llada=True, chexbert_labels=chexbert_labels)
         elif inputs_embeds is None:
-            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes)
+            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels, concept_loss) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes, chexbert_labels=chexbert_labels)
             conversation_ids = None
         if dpo_forward:
             outputs = self.model(
@@ -126,6 +131,7 @@ class LlavaQwen3ModelLM(Qwen3ForCausalLM, LlavaMetaForCausalLM):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
+                concept_loss=concept_loss,
                 conversation_ids=conversation_ids,
                 sampled_finding_token_ids=sampled_finding_token_ids,
                 remaining_finding_token_ids=remaining_finding_token_ids,
@@ -148,7 +154,7 @@ class LlavaQwen3ModelLM(Qwen3ForCausalLM, LlavaMetaForCausalLM):
             raise NotImplementedError("`inputs_embeds` is not supported")
 
         if images is not None:
-            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
+            (inputs, position_ids, attention_mask, _, inputs_embeds, _, _,) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
 
