@@ -913,24 +913,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             x_embeds[:, :inputs_embeds.shape[1]] = inputs_embeds.clone()
             if suffix_embeds is not None:
                 x_embeds[:, -suffix_len:] = suffix_embeds
-            # if image_token_mask is not None:
-            #     prompt_len = inputs_embeds.shape[1]
-            #     image_token_mask_full = torch.zeros((1, total_length), dtype=torch.bool,
-            #                                         device=inputs_embeds.device)
-            #     image_token_mask_full[:, :prompt_len] = image_token_mask
-            #     # Compute fused_feature once before the generation loop
-            #     outputs_pre = self.model(inputs_embeds=x_embeds)
-            #     hs_pre = outputs_pre.last_hidden_state
-            #     image_hidden = hs_pre * image_token_mask_full.unsqueeze(-1).to(hs_pre.dtype)
-            #     image_length = image_token_mask_full.float().sum(dim=1).clamp(min=1e-9)  # float32 to avoid bfloat16 precision loss
-            #     mean_hidden = image_hidden.sum(dim=1) / image_length
-            #     chexbert_logits = self.chexbert_head(mean_hidden)
-            #     chexbert_scores = torch.sigmoid(chexbert_logits)
-            #     concept_feature = torch.matmul(chexbert_scores, self.concept_table)
-            #     fused_feature = self.fuse_head(concept_feature).unsqueeze(1)  # (1, 1, d)
-            # else:
-            #     image_token_mask_full = None
-            #     fused_feature = None
             # Create a tracking tensor for token IDs for final output
             x = torch.full((1, total_length), mask_id, dtype=torch.long, device=inputs_embeds.device)
             if suffix_token_ids is not None:
@@ -1108,10 +1090,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
-        sampled_finding_token_ids: Optional[list] = None,
-        remaining_finding_token_ids: Optional[list] = None,
-        concept_loss: Optional[float] = None,
-        all_finding_token_ids: Optional[list] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
@@ -1154,43 +1132,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
 
-        def forward_process_core_findings(input_embeds, labels, mask_tokenid_list, eps=1e-3, mask_id=126336):
-            """
-            input_embeds: (b, l, d)
-            labels:       (b, l) with -100 as ignore
-            mask_tokenid_list: list[list[int]] length=b, each inner list are token_ids to mask
-            eps: clamp p in [eps, 1-eps]
-            """
-            b, l, d = input_embeds.shape
-            device = input_embeds.device
-
-            valid_mask = (labels != -100)  # (b, l)
-
-            masked_indices = torch.zeros((b, l), dtype=torch.bool, device=device)
-
-            labels_dtype = labels.dtype if labels.dtype in (torch.int64, torch.int32, torch.int16, torch.int8) else torch.long
-
-            for i, tok_list in enumerate(mask_tokenid_list):
-                if not tok_list:
-                    continue
-                tok = torch.as_tensor(tok_list, device=device, dtype=labels_dtype)
-                hit = torch.isin(labels[i].to(labels_dtype), tok)  # (l,)
-                masked_indices[i] = hit
-
-            masked_indices = masked_indices & valid_mask  # (b, l)
-
-            masked_embed = self.model.embed_tokens(torch.tensor([mask_id], device=device, dtype=torch.long))
-
-            noisy_embeds = torch.where(masked_indices.unsqueeze(-1), masked_embed, input_embeds)  # (b, l, d)
-
-            valid_cnt = valid_mask.sum(dim=1).clamp(min=1)       # (b,)
-            masked_cnt = masked_indices.sum(dim=1)               # (b,)
-            p = (masked_cnt.float() / valid_cnt.float()).clamp(min=eps, max=1.0 - eps)  # (b,)
-            p_mask = p[:, None].expand(b, l)                     # (b, l)
-
-            return noisy_embeds, p_mask, masked_embed, masked_indices
-
-
         def forward_process_embeds(input_embeds, labels, eps=1e-3):
             b, l, d = input_embeds.shape
             t = torch.rand(b, device=input_embeds.device)
@@ -1208,323 +1149,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
             return noisy_embeds, p_mask, masked_embed
 
-        def forward_not_core_embeds(input_embeds, labels, eps=1e-3, core_indices=None):
-            b, l, d = input_embeds.shape
-            t = torch.rand(b, device=input_embeds.device)
-            p_mask = (1 - eps) * t + eps
-            p_mask = p_mask[:, None].repeat(1, l)
-
-            masked_indices = torch.rand((b, l), device=input_embeds.device) < p_mask
-            # Add label condition filtering
-            valid_mask = (labels != -100) # Create valid encoding
-            masked_indices = masked_indices & valid_mask & (~core_indices) # Combine random encoding and valid encoding
-            # Magic number 126336 stands for the tokenizer special token,
-            # Magic embeddings, which is used for [MASK] token here,
-            masked_embed = self.model.embed_tokens(torch.tensor([126336]).to(input_embeds.device))
-            noisy_embeds = torch.where(masked_indices.unsqueeze(-1), masked_embed, input_embeds)
-
-            return noisy_embeds, p_mask, masked_embed, t
-        
-        def forward_core_embeds(input_embeds, labels, eps=1e-3, core_indices=None, t=None):
-            b, l, d = input_embeds.shape
-            t_core = torch.clamp(t * 1.2, max=1.0)
-            p_mask = (1 - eps) * t_core + eps
-            p_mask = p_mask[:, None].repeat(1, l)
-
-            masked_indices = torch.rand((b, l), device=input_embeds.device) < p_mask
-            # Add label condition filtering
-            valid_mask = (labels != -100) # Create valid encoding
-            masked_indices = masked_indices & valid_mask & core_indices # Combine random encoding and valid encoding
-            # Magic number 126336 stands for the tokenizer special token,
-            # Magic embeddings, which is used for [MASK] token here,
-            masked_embed = self.model.embed_tokens(torch.tensor([126336]).to(input_embeds.device))
-            noisy_embeds = torch.where(masked_indices.unsqueeze(-1), masked_embed, input_embeds)
-
-            return noisy_embeds, p_mask, masked_embed    
-    
-        if self.stage == 1:
-            all_finding_token_ids = all_finding_token_ids if all_finding_token_ids is not None else []
-            _, _, _, core_indices = forward_process_core_findings(inputs_embeds, labels, all_finding_token_ids)
-            noisy_embeds, p_mask, masked_embed, t = forward_not_core_embeds(inputs_embeds, labels, core_indices=core_indices)
-            masked_indices_nocore = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
-            noisy_embeds_core, p_mask_core, masked_embed = forward_core_embeds(noisy_embeds, labels, core_indices=core_indices, t=t)
-            masked_indices = self.get_masked_indices_from_embeds(noisy_embeds_core, masked_embed) # shape (b, l)
-            p_mask_inv = 1.0 - p_mask
-            p_mask = torch.where(core_indices, p_mask_core, p_mask)
-            bsz, seq_len, _ = inputs_embeds.shape
-            prompt_index = (labels == -100).to(torch.int64)
-            target_mask = (1 - prompt_index).bool() # shape (b, l)
-            masked_indices_nocore_env = (~masked_indices_nocore) & (target_mask) & (~core_indices) # shape (b, l)
-            noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
-            noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1]) # shape (b, l)
-            noisy_embeds_inv = torch.where(masked_indices_nocore_env.view(bsz,seq_len,1),masked_embed,inputs_embeds)
-            t_inv = 1.0 - t
-            noisy_embeds_inv_core, p_mask_core_inv, masked_embed = forward_core_embeds(noisy_embeds_inv, labels, core_indices=core_indices, t=t_inv)
-            masked_indices_inv = self.get_masked_indices_from_embeds(noisy_embeds_inv_core, masked_embed)            
-            labels_env = labels.clone()
-            labels_env[~masked_indices_inv]= -100
-            labels[~masked_indices]= -100
-            labels =  torch.cat([labels,labels_env])
-            noisy_embeds = torch.cat([noisy_embeds_core,noisy_embeds_inv_core])
-            p_mask_inv = torch.where(core_indices, p_mask_core_inv, p_mask_inv)
-            p_mask = torch.cat([p_mask, p_mask_inv], dim=0)
-            noisy_data_length = noisy_data_length.repeat(2, 1)
-            if conversation_ids is not None: 
-                conversation_mask = self._build_conversation_mask_optimized(conversation_ids)
-                if attention_mask is not None:
-                    # 1. Dimension expansion
-                    attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, length) -> (batch, 1, 1, length)
-                    attention_mask = attention_mask.expand_as(conversation_mask) # (batch, 1, 1, length) -> (batch, 1, length, length)
-                    # 2. Mask combination (element-wise multiplication)
-                    combined_mask = conversation_mask * attention_mask
-                else:
-                    # If attention_mask is None, directly use conversation_mask
-                    combined_mask = conversation_mask 
-                attention_mask = combined_mask
-
-            # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=noisy_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                cache_position=cache_position,
-                **kwargs,
-            )
-
-            hidden_states = outputs.last_hidden_state
-            # image_mask = torch.cat([image_mask, image_mask], dim=0).to(hidden_states.dtype)  # shape (2*b, l, 1)
-            # image_hidden = hidden_states * image_mask
-            # # mask = attention_mask.unsqueeze(-1).float() 
-            # # mean_hidden = prompt_hidden.mean(dim=1)
-            # image_length = image_mask.sum(dim=1).clamp(min=1e-9)  # shape: (2*b, 1), avoid division by zero
-            # mean_hidden = (image_hidden.sum(dim=1) / image_length) # Match dtype with model weights
-            # chexbert_logits = self.chexbert_head(mean_hidden)
-            # chexbert_scores = torch.sigmoid(chexbert_logits)
-            # concept_loss = F.binary_cross_entropy(chexbert_scores, chexbert_labels, reduction='mean')
-            # print(f"[Concept Loss] {concept_loss.item():.4f}")
-            # concept_feature = torch.matmul(chexbert_scores, self.concept_table)
-            # fused_feature = self.fuse_head(concept_feature)
-            # fused_feature = fused_feature.unsqueeze(1)
-            # hidden_states = hidden_states + fused_feature * image_mask
-            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-            # slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            # logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-            # loss = None
-            # if labels is not None:
-            #     loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-            pretraining_tp = getattr(self.config, "pretraining_tp", 1)
-            if pretraining_tp > 1:
-                lm_head_slices = self.lm_head.weight.split(self.vocab_size // pretraining_tp, dim=0)
-                logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(pretraining_tp)]
-                logits = torch.cat(logits, dim=-1)
-            else:
-                logits = self.lm_head(hidden_states)
-            logits = logits.float()
-            logits = logits.transpose(1, 2)
-            loss = None
-            if labels is not None:
-                # Change for MDM
-                token_loss = F.cross_entropy(logits, labels, ignore_index=-100,
-                                            reduction='none') / p_mask
-                # token_loss_env = F.cross_entropy(logits[~masked_indices], labels[~masked_indices], ignore_index=-100,
-                #                              reduction='none') / p_mask[~masked_indices]
-                # token_loss = token_loss_noenv + token_loss_env
-                token_loss = token_loss
-                loss = torch.sum(token_loss / noisy_data_length) / labels.shape[0]
-                loss = loss + 0.5 * concept_loss
-            if not return_dict:
-                output = (logits,) + outputs[1:]
-                return (loss,) + output if loss is not None else output
-            return CausalLMOutputWithPast(
-                loss=loss,
-                logits=logits,
-                past_key_values=outputs.past_key_values,
-                hidden_states=outputs.hidden_states,
-                attentions=outputs.attentions,
-            )
-
-        # if self.stage == 1:
-        #     sampled_finding_token_ids = sampled_finding_token_ids if sampled_finding_token_ids is not None else []
-        #     remaining_finding_token_ids = remaining_finding_token_ids if remaining_finding_token_ids is not None else []
-        #     _, _, _, weight_indices = forward_process_core_findings(inputs_embeds, labels, sampled_finding_token_ids)
-        #     _, _, _, weigth_indices_inv = forward_process_core_findings(inputs_embeds, labels, remaining_finding_token_ids)
-        #     weight_mask = torch.cat([weight_indices,weigth_indices_inv])
-        #     noisy_embeds, p_mask, masked_embed = forward_process_embeds(inputs_embeds, labels)
-        #     bsz, seq_len, _ = inputs_embeds.shape
-        #     masked_indices = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
-        #     prompt_index = (labels == -100).to(torch.int64)
-        #     target_mask = (1 - prompt_index).bool() # shape (b, l)
-        #     masked_indices_env = (~masked_indices) & (target_mask)
-        #     noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
-        #     noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1]) # shape (b, l)
-        #     noisy_embeds_inv = torch.where(masked_indices_env.view(bsz,seq_len,1),masked_embed,inputs_embeds)
-        #     labels_env = labels.clone()
-        #     labels_env[masked_indices]= -100
-        #     labels[masked_indices_env]= -100
-        #     labels =  torch.cat([labels,labels_env])
-        #     noisy_embeds = torch.cat([noisy_embeds,noisy_embeds_inv])
-        #     p_mask_inv = 1.0 - p_mask
-        #     p_mask = torch.cat([p_mask, p_mask_inv], dim=0)
-        #     noisy_data_length = noisy_data_length.repeat(2, 1)
-        #     loss_weight = torch.ones_like(labels, dtype=torch.float)  # shape: (2*b, l)
-        #     loss_weight[weight_mask] = 2.0
-        #     if conversation_ids is not None: 
-        #         conversation_mask = self._build_conversation_mask_optimized(conversation_ids)
-        #         if attention_mask is not None:
-        #             # 1. Dimension expansion
-        #             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, length) -> (batch, 1, 1, length)
-        #             attention_mask = attention_mask.expand_as(conversation_mask) # (batch, 1, 1, length) -> (batch, 1, length, length)
-        #             # 2. Mask combination (element-wise multiplication)
-        #             combined_mask = conversation_mask * attention_mask
-        #         else:
-        #             # If attention_mask is None, directly use conversation_mask
-        #             combined_mask = conversation_mask 
-        #         attention_mask = combined_mask
-
-        #     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        #     outputs = self.model(
-        #         input_ids=input_ids,
-        #         attention_mask=attention_mask,
-        #         position_ids=position_ids,
-        #         past_key_values=past_key_values,
-        #         inputs_embeds=noisy_embeds,
-        #         use_cache=use_cache,
-        #         output_attentions=output_attentions,
-        #         output_hidden_states=output_hidden_states,
-        #         return_dict=return_dict,
-        #         cache_position=cache_position,
-        #         **kwargs,
-        #     )
-
-        #     hidden_states = outputs.last_hidden_state
-        #     # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        #     # slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        #     # logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-        #     # loss = None
-        #     # if labels is not None:
-        #     #     loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-        #     pretraining_tp = getattr(self.config, "pretraining_tp", 1)
-        #     if pretraining_tp > 1:
-        #         lm_head_slices = self.lm_head.weight.split(self.vocab_size // pretraining_tp, dim=0)
-        #         logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(pretraining_tp)]
-        #         logits = torch.cat(logits, dim=-1)
-        #     else:
-        #         logits = self.lm_head(hidden_states)
-        #     logits = logits.float()
-        #     logits = logits.transpose(1, 2)
-        #     loss = None
-        #     if labels is not None:
-        #         # Change for MDM
-        #         token_loss = F.cross_entropy(logits, labels, ignore_index=-100,
-        #                                     reduction='none') / p_mask
-        #         # token_loss_env = F.cross_entropy(logits[~masked_indices], labels[~masked_indices], ignore_index=-100,
-        #         #                              reduction='none') / p_mask[~masked_indices]
-        #         # token_loss = token_loss_noenv + token_loss_env
-        #         token_loss = token_loss * loss_weight 
-        #         loss = torch.sum(token_loss / noisy_data_length) / labels.shape[0]
-
-        #     if not return_dict:
-        #         output = (logits,) + outputs[1:]
-        #         return (loss,) + output if loss is not None else output
-        #     return CausalLMOutputWithPast(
-        #         loss=loss,
-        #         logits=logits,
-        #         past_key_values=outputs.past_key_values,
-        #         hidden_states=outputs.hidden_states,
-        #         attentions=outputs.attentions,
-        #     )
-        
-# 2 stage remask stage 1
-            # masked_len = masked_indices.sum(dim=-1, keepdim=True)
-            # masked_len = masked_len.repeat(1, noisy_embeds.shape[1])
-            # masked_len_inv = masked_indices_inv.sum(dim=-1, keepdim=True)
-            # masked_len_inv = masked_len_inv.repeat(1, noisy_embeds.shape[1])
-            # noisy_data_length = torch.cat([masked_len, masked_len_inv])
-            # prompt_index = (labels == -100).to(torch.int64)
-            # noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
-            # noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1])
-            # noisy_data_length = noisy_data_length.repeat(2, 1)
-            # labels_inv = labels.clone()
-            # labels_inv[~masked_indices_inv]= -100
-            # labels[~masked_indices]= -100
-            # labels =  torch.cat([labels,labels_inv])
-            # noisy_embeds = torch.cat([noisy_embeds,noisy_embeds_inv])
-            # p_mask = torch.cat([p_mask, p_mask_inv], dim=0)
-            # if conversation_ids is not None: 
-            #     conversation_mask = self._build_conversation_mask_optimized(conversation_ids)
-            #     if attention_mask is not None:
-            #         # 1. Dimension expansion
-            #         attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, length) -> (batch, 1, 1, length)
-            #         attention_mask = attention_mask.expand_as(conversation_mask) # (batch, 1, 1, length) -> (batch, 1, length, length)
-            #         # 2. Mask combination (element-wise multiplication)
-            #         combined_mask = conversation_mask * attention_mask
-            #     else:
-            #         # If attention_mask is None, directly use conversation_mask
-            #         combined_mask = conversation_mask 
-            #     attention_mask = combined_mask
-
-            # # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-            # outputs = self.model(
-            #     input_ids=input_ids,
-            #     attention_mask=attention_mask,
-            #     position_ids=position_ids,
-            #     past_key_values=past_key_values,
-            #     inputs_embeds=noisy_embeds,
-            #     use_cache=use_cache,
-            #     output_attentions=output_attentions,
-            #     output_hidden_states=output_hidden_states,
-            #     return_dict=return_dict,
-            #     cache_position=cache_position,
-            #     **kwargs,
-            # )
-
-            # hidden_states = outputs.last_hidden_state
-            # # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-            # # slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            # # logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-            # # loss = None
-            # # if labels is not None:
-            # #     loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-            # pretraining_tp = getattr(self.config, "pretraining_tp", 1)
-            # if pretraining_tp > 1:
-            #     lm_head_slices = self.lm_head.weight.split(self.vocab_size // pretraining_tp, dim=0)
-            #     logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(pretraining_tp)]
-            #     logits = torch.cat(logits, dim=-1)
-            # else:
-            #     logits = self.lm_head(hidden_states)
-            # logits = logits.float()
-            # logits = logits.transpose(1, 2)
-            # loss = None
-            # if labels is not None:
-            #     # Change for MDM
-            #     token_loss = F.cross_entropy(logits, labels, ignore_index=-100,
-            #                                 reduction='none') / p_mask
-            #     # token_loss_env = F.cross_entropy(logits[~masked_indices], labels[~masked_indices], ignore_index=-100,
-            #     #                              reduction='none') / p_mask[~masked_indices]
-            #     # token_loss = token_loss_noenv + token_loss_env
-            #     loss = torch.sum(token_loss / noisy_data_length) / labels.shape[0]
-
-            # if not return_dict:
-            #     output = (logits,) + outputs[1:]
-            #     return (loss,) + output if loss is not None else output
-            # return CausalLMOutputWithPast(
-            #     loss=loss,
-            #     logits=logits,
-            #     past_key_values=outputs.past_key_values,
-            #     hidden_states=outputs.hidden_states,
-            #     attentions=outputs.attentions,
-            # )
-        
-        if self.stage == 2:
+        if self.stage in (1, 2):
             noisy_embeds, p_mask, masked_embed = forward_process_embeds(inputs_embeds, labels)
             bsz, seq_len, _ = inputs_embeds.shape
             masked_indices = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
@@ -1571,13 +1196,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             )
 
             hidden_states = outputs.last_hidden_state
-            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-            # slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            # logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-            # loss = None
-            # if labels is not None:
-            #     loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
             pretraining_tp = getattr(self.config, "pretraining_tp", 1)
             if pretraining_tp > 1:
                 lm_head_slices = self.lm_head.weight.split(self.vocab_size // pretraining_tp, dim=0)
@@ -1589,12 +1207,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             logits = logits.transpose(1, 2)
             loss = None
             if labels is not None:
-                # Change for MDM
                 token_loss = F.cross_entropy(logits, labels, ignore_index=-100,
                                             reduction='none') / p_mask
-                # token_loss_env = F.cross_entropy(logits[~masked_indices], labels[~masked_indices], ignore_index=-100,
-                #                              reduction='none') / p_mask[~masked_indices]
-                # token_loss = token_loss_noenv + token_loss_env
                 loss = torch.sum(token_loss / noisy_data_length) / labels.shape[0]
 
             if not return_dict:

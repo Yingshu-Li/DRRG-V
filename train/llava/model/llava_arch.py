@@ -23,7 +23,6 @@ import torch.nn as nn
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_resampler.builder import build_vision_resampler
 from .multimodal_projector.builder import build_vision_projector
-import torch.nn.functional as F
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 from llava.mm_utils import get_anyres_image_grid_shape
@@ -270,23 +269,10 @@ class LlavaMetaForCausalLM(ABC):
         image_feature = image_feature.view(num_frames, -1, num_dim)
         return image_feature
 
-    def encode_images(self, images, chexbert_labels=None):
-        image_features_original = self.get_model().get_vision_tower()(images)
-        mean_hidden = torch.mean(image_features_original, dim=1)  # Match dtype with model weights
-        chexbert_logits = self.chexbert_head(mean_hidden)
-        chexbert_scores = torch.sigmoid(chexbert_logits)
-        if chexbert_labels is not None:
-            concept_loss = F.binary_cross_entropy(chexbert_scores, chexbert_labels, reduction='mean')
-            print(f"[Concept Loss] {concept_loss.item():.4f}")
-        else:
-            concept_loss = None
-        concept_feature = torch.matmul(chexbert_scores, self.concept_table)
-        fused_feature = self.fuse_head(concept_feature)
-        fused_feature = fused_feature.unsqueeze(1)
-        image_features_original = image_features_original + fused_feature   
-        # image_features = self.get_model().vision_resampler(image_features, images=images)
-        image_features = self.get_model().mm_projector(image_features_original)
-        return image_features, concept_loss
+    def encode_images(self, images):
+        image_features = self.get_model().get_vision_tower()(images)
+        image_features = self.get_model().mm_projector(image_features)
+        return image_features
     
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
         videos_or_images_features = self.get_model().get_vision_tower()(videos_or_images)
@@ -440,7 +426,7 @@ class LlavaMetaForCausalLM(ABC):
         
         return conversation_ids
 
-    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None, is_llada=False, chexbert_labels=None):
+    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None, is_llada=False):
         vision_tower = self.get_vision_tower()
         # rank_print(modalities)
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -468,7 +454,7 @@ class LlavaMetaForCausalLM(ABC):
 
             concat_images = torch.cat([image for image in images_list], dim=0)
             split_sizes = [image.shape[0] for image in images_list]
-            encoded_image_features, concept_loss = self.encode_images(concat_images, chexbert_labels=chexbert_labels)        
+            encoded_image_features = self.encode_images(concat_images)
             # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
 
             # This is a list, each element is [num_images, patch * patch, dim]
@@ -606,7 +592,7 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features, concept_loss = self.encode_images(images)
+            image_features = self.encode_images(images)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
@@ -757,10 +743,9 @@ class LlavaMetaForCausalLM(ABC):
         # add conversation_ids 
         if is_llada and attention_mask is not None: 
             conversation_ids = self.generate_conversation_ids(new_labels)
-            return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, conversation_ids, concept_loss
-        # import pdb; pdb.set_trace()
-        # rank0_print("Finish preparing")
-        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, concept_loss
+            return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, conversation_ids
+
+        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:

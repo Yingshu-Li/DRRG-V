@@ -9,6 +9,7 @@ from torch.utils.data import Dataset, Sampler, DataLoader
 from transformers import Trainer
 from transformers.trainer import is_sagemaker_mp_enabled, get_parameter_names, has_length, logger, is_accelerate_available, is_datasets_available
 from accelerate.utils import GradientAccumulationPlugin
+from functools import partial
 from transformers.trainer_utils import seed_worker
 from transformers.trainer_pt_utils import get_length_grouped_indices as get_length_grouped_indices_hf
 from transformers.trainer_pt_utils import AcceleratorConfig
@@ -347,7 +348,7 @@ class LLaVATrainer(Trainer):
         if not isinstance(train_dataset, torch.utils.data.IterableDataset):
             dataloader_params["sampler"] = self._get_train_sampler()
             dataloader_params["drop_last"] = self.args.dataloader_drop_last
-            dataloader_params["worker_init_fn"] = seed_worker
+            dataloader_params["worker_init_fn"] = partial(seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index)
             dataloader_params["prefetch_factor"] = self.args.dataloader_num_workers * 2 if self.args.dataloader_num_workers != 0 else None
 
         if hasattr(self.args, "use_webdataset") and self.args.use_webdataset:

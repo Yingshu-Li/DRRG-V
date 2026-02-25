@@ -46,7 +46,7 @@ echo "BASE_RUN_NAME: ${BASE_RUN_NAME}"
 
 ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_node} --master_addr=${MASTER_ADDR} --master_port ${MASTER_PORT} --node_rank=${RANK} \
     llava/train/train_mem.py \
-    --deepspeed scripts/zero3.json \
+    --deepspeed scripts/zero2.json \
     --model_name_or_path "/mnt/sdc/shaoyang/LLaDA-V/DRRG/qwen-dllm" \
     --version ${PROMPT_VERSION} \
     --data_path "/mnt/sdc/shaoyang/DRRG/data/llada_with_chexbert_labels.json" \
@@ -84,7 +84,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --tf32 True \
     --model_max_length 1600 \
     --gradient_checkpointing True \
-    --dataloader_num_workers 0 \
+    --dataloader_num_workers 4 \
     --lazy_preprocess True \
     --report_to tensorboard \
     --dataloader_drop_last True \
