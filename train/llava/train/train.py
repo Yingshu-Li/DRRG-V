@@ -52,14 +52,14 @@ from llava.mm_utils import process_highres_image, process_anyres_image, process_
 from llava.utils import rank0_print, process_video_with_pyav, process_video_with_decord, rank_print
 from llava.model.language_model.llava_llada import LlavaLLaDAModelLM
 from llava.model.language_model.llava_qwen import LlavaQwen3ModelLM
-import debugpy
-try:
-    # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
-    debugpy.listen(("localhost", 9501))
-    print("Waiting for debugger attach")
-    debugpy.wait_for_client()
-except Exception as e:
-    pass
+# import debugpy
+# try:
+#     # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
+#     debugpy.listen(("localhost", 9501))
+#     print("Waiting for debugger attach")
+#     debugpy.wait_for_client()
+# except Exception as e:
+#     pass
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
