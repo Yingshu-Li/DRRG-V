@@ -132,8 +132,8 @@ class Llava_OneVersion_Qwen(lmms):
         self.batch_size_ppl = batch_size_ppl
         self.is_check_greedy = is_check_greedy
         assert mc_num % self.batch_size_ppl == 0
-        print(f'model: {pretrained}')
-        print(f'Is check greedy: {is_check_greedy}')
+        eval_logger.info(f'model: {pretrained}')
+        eval_logger.info(f'Is check greedy: {is_check_greedy}')
 
         qwen_model_args = {
             "multimodal": True,
@@ -554,17 +554,12 @@ class Llava_OneVersion_Qwen(lmms):
                     image_tokens = [DEFAULT_IMAGE_TOKEN] * placeholder_count
                     image_tokens = " ".join(image_tokens)
                     question = image_tokens + "\n" + context
-                    if "think_mode" in gen_kwargs and gen_kwargs["think_mode"] == "no_think":
-                        question = question + " /no_think"
-                    elif "think_mode" in gen_kwargs and gen_kwargs["think_mode"] == "think":
-                        question = question + " /think"
-                    else: 
-                        question = question
+                    # Note: /no_think and /think are NOT appended to avoid train/eval mismatch
                 else:
                     question = context
 
                 # This is much safer for llama3, as we now have some object type in it
-                if "llama_3" or "llava_llada" in self.conv_template:
+                if "llama_3" in self.conv_template or "llava_llada" in self.conv_template:
                     conv = copy.deepcopy(conv_templates[self.conv_template])
                 else:
                     conv = conv_templates[self.conv_template].copy()
@@ -586,13 +581,10 @@ class Llava_OneVersion_Qwen(lmms):
                     prompt_question = conv.get_prompt()
                     question_input.append(prompt_question)
                 
-            print(question_input)
-            print('--------------------------------')
-
             if "temperature" not in gen_kwargs:
                 gen_kwargs["temperature"] = 0
-            if "cfg" not in gen_kwargs:
-                gen_kwargs["cfg"] = 0.
+            if "cfg_scale" not in gen_kwargs:
+                gen_kwargs["cfg_scale"] = 0.
             if "remasking" not in gen_kwargs:
                 gen_kwargs["remasking"] = "low_confidence"
             if "gen_length" not in gen_kwargs:
@@ -602,11 +594,11 @@ class Llava_OneVersion_Qwen(lmms):
             if "gen_steps" not in gen_kwargs and "steps" not in gen_kwargs:
                 gen_kwargs["steps"] = 2
             elif "gen_steps" in gen_kwargs and "steps" not in gen_kwargs:
-                gen_kwargs["steps"] = gen_kwargs["gen_steps"]
+                gen_kwargs["steps"] = gen_kwargs.pop("gen_steps")
 
             input_ids_list = [tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt") for prompt in question_input]
-            # Use EOS token for padding (consistent with MDM training convention)
-            pad_token_ids = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else self.tokenizer.pad_token_id
+            # Use pad_token_id for padding (NOT eos_token_id, because <|im_end|> == eos and appears in the prompt)
+            pad_token_ids = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
             input_ids = self.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_ids).to(self.device)
             attention_masks = input_ids.ne(pad_token_ids).to(self.device)
 
@@ -645,20 +637,14 @@ class Llava_OneVersion_Qwen(lmms):
             # TODO: attention to this major generation step...
             if "image_aspect_ratio" in gen_kwargs.keys():
                 gen_kwargs.pop("image_aspect_ratio")
-            try:
-                with torch.inference_mode():
-                    cont = self.model.generate(input_ids, attention_mask=attention_masks, pad_token_id=pad_token_ids, images=image_tensor, use_cache=False, **gen_kwargs)
-                    # cont = self.model.generate(qwen_input_ids, pad_token_id=pad_token_ids, images=image_tensor, use_cache=self.use_cache, **gen_kwargs)
+            with torch.inference_mode():
+                cont = self.model.generate(input_ids, attention_mask=attention_masks, pad_token_id=pad_token_ids, images=image_tensor, use_cache=False, **gen_kwargs)
 
-                text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
-                text_outputs = [clean_report_text(output) for output in text_outputs]
-                text_outputs = [output[:-1] if output.endswith('.') else output for output in text_outputs]
-                num_tokens += (cont != self.tokenizer.eos_token_id).sum()
-
-                print(text_outputs)
-                print('--------------------------------')
-            except Exception as e:
-                raise e
+            text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
+            text_outputs = [clean_report_text(output) for output in text_outputs]
+            # Remove trailing period to match reference data format for metric consistency
+            text_outputs = [output[:-1] if output.endswith('.') else output for output in text_outputs]
+            num_tokens += (cont != self.tokenizer.eos_token_id).sum()
 
             text_outputs = [response.strip() for response in text_outputs]
             res.extend(text_outputs)
@@ -667,9 +653,7 @@ class Llava_OneVersion_Qwen(lmms):
             # reorder this group of results back to original unsorted form
         res = re_ords.get_original(res)
         end_time = time.time()
-        print(f"Time taken: {end_time - start_time} seconds")
-        print(f"Tokens per second: {num_tokens / (end_time - start_time)}")
-        print(f"Total number of tokens: {num_tokens}")
+        eval_logger.info(f"Time taken: {end_time - start_time:.1f}s, Tokens: {num_tokens}, Tokens/s: {num_tokens / (end_time - start_time):.1f}")
         pbar.close()
         return res
 

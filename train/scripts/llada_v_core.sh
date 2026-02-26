@@ -1,7 +1,7 @@
 export OMP_NUM_THREADS=8
 export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=3
-export CUDA_VISIBLE_DEVICES=2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export NCCL_SOCKET_IFNAME=eno1
 export NCCL_DEBUG=WARN
 export NCCL_DEBUG_SUBSYS=ALL
@@ -41,7 +41,7 @@ VISION_MODEL_VERSION_CLEAN="${VISION_MODEL_VERSION//\//_}"
 
 PROMPT_VERSION="qwen"
 
-BASE_RUN_NAME="llada_v_core_random_TEST"
+BASE_RUN_NAME="llada_v_core_fixed_test"
 echo "BASE_RUN_NAME: ${BASE_RUN_NAME}"
 
 ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_node} --master_addr=${MASTER_ADDR} --master_port ${MASTER_PORT} --node_rank=${RANK} \
@@ -68,13 +68,13 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=${gpu_num} --nnodes=${num_no
     --bf16 True \
     --run_name $BASE_RUN_NAME \
     --output_dir "exp/$BASE_RUN_NAME" \
-    --num_train_epochs 3 \
-    --per_device_train_batch_size 4 \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 6 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 2 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 5000 \
+    --save_steps 1000 \
     --save_total_limit 1 \
     --learning_rate 1e-4 \
     --weight_decay 0. \

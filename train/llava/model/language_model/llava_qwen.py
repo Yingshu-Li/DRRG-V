@@ -85,9 +85,10 @@ class LlavaQwen3ModelLM(Qwen3ForCausalLM, LlavaMetaForCausalLM):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if inputs_embeds is None:
             (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes)
-        # MDM uses full bidirectional attention, no attention mask needed (following dLLM convention)
-        attention_mask = None
+        # MDM uses full bidirectional attention (is_causal=False in _update_causal_mask).
+        # Keep attention_mask for padding masking — padding tokens should not be attended to.
         conversation_ids = None
+
         if dpo_forward:
             outputs = self.model(
                 input_ids=input_ids,
@@ -140,7 +141,7 @@ class LlavaQwen3ModelLM(Qwen3ForCausalLM, LlavaMetaForCausalLM):
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
 
-        return super().generate_with_embeds(inputs_embeds=inputs_embeds, **kwargs)
+        return super().generate_with_embeds(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **kwargs)
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)

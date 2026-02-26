@@ -842,7 +842,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
     @torch.no_grad()
     def generate_with_embeds(self, inputs_embeds, steps=128, gen_length=128, block_length=128, temperature=0.,
-        cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None, use_length_prediction=False, stopping_criteria=None, generation_suffix=None, image_token_mask=None, **kwargs):
+        cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None, use_length_prediction=False, stopping_criteria=None, generation_suffix=None, image_token_mask=None, attention_mask=None, **kwargs):
         '''
         Args:
             inputs_embeds: A tensor of shape (1, l, d).
@@ -918,7 +918,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             if suffix_token_ids is not None:
                 x[:, -suffix_len:] = suffix_token_ids
 
-            # prompt_index: A tensor of shape (1, l + gen_length + suffix_len) where the first l elements are 1 (representing the prompt) 
+            # Build full attention_mask for the entire sequence (prompt + gen + suffix).
+            # Generation and suffix positions are always attended to (1).
+            # Prompt positions use the provided attention_mask to mask out any padding.
+            full_attention_mask = torch.ones((1, total_length), dtype=torch.long, device=inputs_embeds.device)
+            if attention_mask is not None:
+                prompt_len = inputs_embeds.shape[1]
+                full_attention_mask[:, :prompt_len] = attention_mask[:, :prompt_len]
+
+            # prompt_index: A tensor of shape (1, l + gen_length + suffix_len) where the first l elements are 1 (representing the prompt)
             # and the remaining gen_length+suffix_len elements are 0 (representing the generated part)
             prompt_index = torch.zeros((1, total_length), dtype=torch.bool, device=inputs_embeds.device)
             prompt_index[:, :inputs_embeds.shape[1]] = 1 # shape (1, l + gen_length + suffix_len)
@@ -961,14 +969,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     # Determine which positions are mask embeddings
                     mask_index = torch.all(torch.abs(x_embeds - masked_embed) < 1e-5, dim=2)
 
-                    # If a stop word has been found, check if the masks before the stop word are all filled
-                    if found_stop_seq:
-                        # Get the mask state before the stop word
-                        pre_stop_masks = mask_index[0, inputs_embeds.shape[1]:stop_position]
-                        # If the masks before the stop word are all filled, exit generation
-                        if not pre_stop_masks.any():
-                            break
-                    
                     # Check if there are any masks left to fill in the current block
                     current_block_masks = mask_index[0, block_start:block_end]
                     if not current_block_masks.any():
@@ -981,16 +981,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         un_embeds[un_mask] = masked_embed.repeat(x_embeds.shape[0],x_embeds.shape[1],1)[un_mask] # Use repeat to avoid the complexity of expand_as
                         combined_embeds = torch.cat([x_embeds, un_embeds], dim=0)
                         
-                        # Forward pass
-                        outputs = self.model(inputs_embeds=combined_embeds)
-                        logits = self.lm_head(outputs[0]).float()                       
-                        
+                        # Forward pass (CFG doubles the batch, so double attention_mask too)
+                        cfg_attn_mask = full_attention_mask.repeat(2, 1)
+                        outputs = self.model(inputs_embeds=combined_embeds, attention_mask=cfg_attn_mask)
+                        logits = self.lm_head(outputs[0]).float()
+
                         # Split and apply CFG
                         logits, un_logits = torch.chunk(logits, 2, dim=0)
                         logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                     else:
                         # Forward pass (required every step as x_embeds changes)
-                        outputs = self.model(inputs_embeds=x_embeds)
+                        outputs = self.model(inputs_embeds=x_embeds, attention_mask=full_attention_mask)
                         logits = self.lm_head(outputs[0]).float()
                     
                     for token_id in [126081, 126080, 126346, 126347]:
@@ -1010,12 +1011,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     else:
                         raise NotImplementedError(remasking)
                     
-                    # If a stop word is found, only process positions before the stop word
-                    if found_stop_seq:
-                        x0_p[:, stop_position:] = -np.inf
-                    else:
-                        # Prevent processing future blocks
-                        x0_p[:, block_end:] = -np.inf
+                    # Prevent processing future blocks
+                    x0_p[:, block_end:] = -np.inf
 
                     # Do not allow the generated suffix part to be overwritten
                     if suffix_len > 0:
@@ -1038,27 +1035,20 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     x_embeds[transfer_index] = x0_embeds[transfer_index]
                     x[transfer_index] = x0[transfer_index]
 
-                    # New: Check for stop words after each update
-                    if stopping_criteria is not None:
-                        # Only check the generated part (excluding the suffix)
-                        generated_part = x[0, inputs_embeds.shape[1]:inputs_embeds.shape[1]+gen_length]
-                        current_stop_position = None
-                        
-                        for stop_seq in stop_tokens:
-                            if not isinstance(stop_seq, list):
-                                stop_seq = [stop_seq]
-                            # Check if the generated sequence contains stop words
-                            for start_idx in range(generated_part.size(0) - len(stop_seq) + 1):
-                                if torch.all(generated_part[start_idx:start_idx + len(stop_seq)] == torch.tensor(stop_seq, device=x.device)):
-                                    # Calculate the position of the currently found stop word
-                                    current_position = inputs_embeds.shape[1] + start_idx
-                                    # If it is the first time a stop word is found, or this stop word is earlier than the previously found one
-                                    if not found_stop_seq or current_position < stop_position:
-                                        stop_position = current_position
-                                        found_stop_seq = True
-                                    break
-                            if found_stop_seq and current_stop_position is None:
-                                break
+            # Check for stop words only on the final result (not during intermediate diffusion steps,
+            # because intermediate tokens are unreliable and early EOS detection truncates output)
+            if stopping_criteria is not None:
+                generated_part = x[0, inputs_embeds.shape[1]:inputs_embeds.shape[1]+gen_length]
+                for stop_seq in stop_tokens:
+                    if not isinstance(stop_seq, list):
+                        stop_seq = [stop_seq]
+                    for start_idx in range(generated_part.size(0) - len(stop_seq) + 1):
+                        if torch.all(generated_part[start_idx:start_idx + len(stop_seq)] == torch.tensor(stop_seq, device=x.device)):
+                            current_position = inputs_embeds.shape[1] + start_idx
+                            if not found_stop_seq or current_position < stop_position:
+                                stop_position = current_position
+                                found_stop_seq = True
+                            break
 
             # Return the generated result, up to stop_position, and append the suffix
             if found_stop_seq:
@@ -1133,7 +1123,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
 
         def forward_process_embeds(input_embeds, labels, eps=1e-3):
-            b, l, d = input_embeds.shape
+            b, l, _ = input_embeds.shape
             t = torch.rand(b, device=input_embeds.device)
             p_mask = (1 - eps) * t + eps
             p_mask = p_mask[:, None].repeat(1, l)
@@ -1157,6 +1147,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             target_mask = (1 - prompt_index).bool() # shape (b, l)
             masked_indices_env = (~masked_indices) & (target_mask)
             noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
+
             noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1]) # shape (b, l)
             noisy_embeds_inv = torch.where(masked_indices_env.view(bsz,seq_len,1),masked_embed,inputs_embeds)
             labels_env = labels.clone()
@@ -1166,13 +1157,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             noisy_embeds = torch.cat([noisy_embeds,noisy_embeds_inv])
             p_mask_inv = 1.0 - p_mask
             p_mask = torch.cat([p_mask, p_mask_inv], dim=0)
+            p_mask = torch.clamp(p_mask, min=1e-3)  # Numerical stability: prevent near-zero division
             noisy_data_length = noisy_data_length.repeat(2, 1)
+            # Double attention_mask for complementary masking (batch is doubled)
+            if attention_mask is not None:
+                attention_mask = attention_mask.repeat(2, 1)
 
-            # MDM uses full bidirectional attention (no causal/padding mask)
-            # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+            # MDM uses full bidirectional attention (is_causal=False), but attention_mask
+            # is used to mask out padding positions so they don't pollute representations.
             outputs = self.model(
                 input_ids=input_ids,
-                attention_mask=None,
+                attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 inputs_embeds=noisy_embeds,
@@ -1226,7 +1221,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             prompt_lens = ((labels == -100) & (attention_mask == 1)).sum(dim=1)
             bsz, seq_len,  _ = inputs_embeds.shape
             masked_embed = self.model.embed_tokens(torch.tensor([mask_id], device=inputs_embeds.device))
-            eos_embed = self.model.embed_tokens(torch.tensor([eos_token_id], device=inputs_embeds.device))
             eos_label_mask = (labels == eos_token_id)
             if eos_label_mask.sum() == 0:
                 raise ValueError("No EOS token found in labels when stage == 3.")
@@ -1275,9 +1269,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             mask_start = prompt_lens.unsqueeze(1)
             mask_end   = (prompt_lens + length_pred_len).unsqueeze(1)
             mask_length = (position_ids_new >= mask_start) & (position_ids_new < mask_end)
-            prompt_mask = position_ids_new < prompt_lens.unsqueeze(1)         
-            pad_mask    = attention_mask == 0                     
-            ignore_mask = prompt_mask | pad_mask
             gt = torch.zeros((bsz, max_total_len), device=inputs_embeds.device, dtype=inputs_embeds.dtype)
             # gt[ignore_mask] = neg_inf
             batch_idx = torch.arange(bsz, device=inputs_embeds.device)
