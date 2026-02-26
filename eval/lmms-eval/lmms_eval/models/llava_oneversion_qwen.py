@@ -647,6 +647,11 @@ class Llava_OneVersion_Qwen(lmms):
             num_tokens += (cont != self.tokenizer.eos_token_id).sum()
 
             text_outputs = [response.strip() for response in text_outputs]
+
+            # Print prompt and generated text for monitoring
+            for idx, output in enumerate(text_outputs):
+                print(f"\n{'='*60}\n[PROMPT]: {question_input[idx]}\n[OUTPUT]: {output}\n{'='*60}", flush=True)
+
             res.extend(text_outputs)
             self.cache_hook.add_partial("generate_until", (context, gen_kwargs), text_outputs)
             pbar.update(1)

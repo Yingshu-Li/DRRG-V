@@ -7,7 +7,7 @@ export PYTHONPATH=$(pwd)/lmms-eval:$(pwd):$PYTHONPATH
 mkdir -p "${HF_HOME}"
 # Define multiple model paths
 MODEL_PATHS=(
-    "/mnt/sdc/shaoyang/DRRG-V/train/exp/llada_v_core_fixed_test50"
+    "/mnt/sdc/shaoyang/DRRG-V/train/exp/llada_v_core_fixed_test/checkpoint-1000"
 )
 
 # Set output path
