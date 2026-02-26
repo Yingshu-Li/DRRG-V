@@ -10,3 +10,7 @@ DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_IMAGE_PATCH_TOKEN = "<im_patch>"
 DEFAULT_IM_START_TOKEN = "<im_start>"
 DEFAULT_IM_END_TOKEN = "<im_end>"
+
+# Diffusion model token constants (Qwen3 special tokens)
+MASK_TOKEN_ID = 126336
+FORBIDDEN_TOKEN_IDS = [126081, 126080, 126346, 126347]

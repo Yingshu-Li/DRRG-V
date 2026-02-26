@@ -38,7 +38,7 @@ def clean_report_text(text: str) -> str:
     text = re.sub(r'---, ---, ---', '', text)
     text = re.sub(r'\(__, __, ___\)', '', text)
     text = re.sub(r'[_-]+', ' ', text)
-    text = re.sub(r'[^\w\s.,:;()\-]', '', text)
+    text = re.sub(r"[^\w\s.,:;()\-/><+']", '', text)
     text = re.sub(r'\s{2,}', ' ', text).strip()
     return text
 
@@ -329,18 +329,18 @@ class Llava_OneVersion_Qwen(lmms):
 
                     image_tensor = process_images(visual, self._image_processor, self._config)
                     if type(image_tensor) is list:
-                        image_tensor = [_image.to(dtype=torch.float16, device=self.device) for _image in image_tensor]
+                        image_tensor = [_image.to(dtype=self._model.dtype, device=self.device) for _image in image_tensor]
                     else:
-                        image_tensor = image_tensor.to(dtype=torch.float16, device=self.device)
+                        image_tensor = image_tensor.to(dtype=self._model.dtype, device=self.device)
 
                     task_type = "video"
 
                 elif type(visual[0]) == PIL.Image.Image:
                     image_tensor = process_images(visual, self._image_processor, self._config)
                     if type(image_tensor) is list:
-                        image_tensor = [_image.to(dtype=torch.float16, device=self.device) for _image in image_tensor]
+                        image_tensor = [_image.to(dtype=self._model.dtype, device=self.device) for _image in image_tensor]
                     else:
-                        image_tensor = image_tensor.to(dtype=torch.float16, device=self.device)
+                        image_tensor = image_tensor.to(dtype=self._model.dtype, device=self.device)
 
                     task_type = "image"
 
@@ -506,9 +506,9 @@ class Llava_OneVersion_Qwen(lmms):
 
                         image_tensor = process_images(visual, self._image_processor, self._config)
                         if type(image_tensor) is list:
-                            image_tensor = [_image.to(dtype=torch.float16, device=self.device) for _image in image_tensor]
+                            image_tensor = [_image.to(dtype=self._model.dtype, device=self.device) for _image in image_tensor]
                         else:
-                            image_tensor = image_tensor.to(dtype=torch.float16, device=self.device)
+                            image_tensor = image_tensor.to(dtype=self._model.dtype, device=self.device)
 
                         task_type = "video"
                         placeholder_count = 1
@@ -516,9 +516,9 @@ class Llava_OneVersion_Qwen(lmms):
                     elif type(visual[0]) == PIL.Image.Image:  # For image, multi-image tasks
                         image_tensor = process_images(visual, self._image_processor, self._config)
                         if type(image_tensor) is list:
-                            image_tensor = [_image.to(dtype=torch.float16, device=self.device) for _image in image_tensor]
+                            image_tensor = [_image.to(dtype=self._model.dtype, device=self.device) for _image in image_tensor]
                         else:
-                            image_tensor = image_tensor.to(dtype=torch.float16, device=self.device)
+                            image_tensor = image_tensor.to(dtype=self._model.dtype, device=self.device)
 
                         task_type = "image"
                         placeholder_count = len(visual) if isinstance(visual, list) else 1
@@ -588,11 +588,11 @@ class Llava_OneVersion_Qwen(lmms):
             if "remasking" not in gen_kwargs:
                 gen_kwargs["remasking"] = "low_confidence"
             if "gen_length" not in gen_kwargs:
-                gen_kwargs["gen_length"] = 2
+                gen_kwargs["gen_length"] = 120
             if "block_length" not in gen_kwargs:
-                gen_kwargs["block_length"] = 2
+                gen_kwargs["block_length"] = 120
             if "gen_steps" not in gen_kwargs and "steps" not in gen_kwargs:
-                gen_kwargs["steps"] = 2
+                gen_kwargs["steps"] = 120
             elif "gen_steps" in gen_kwargs and "steps" not in gen_kwargs:
                 gen_kwargs["steps"] = gen_kwargs.pop("gen_steps")
 
@@ -748,9 +748,9 @@ class Llava_OneVersion_Qwen(lmms):
 
                             image_tensor = process_images(visual, self._image_processor, self._config)
                             if type(image_tensor) is list:
-                                image_tensor = [_image.to(dtype=torch.float16, device=self.device) for _image in image_tensor]
+                                image_tensor = [_image.to(dtype=self._model.dtype, device=self.device) for _image in image_tensor]
                             else:
-                                image_tensor = image_tensor.to(dtype=torch.float16, device=self.device)
+                                image_tensor = image_tensor.to(dtype=self._model.dtype, device=self.device)
 
                             task_type = "video"
                             placeholder_count = 1
@@ -758,9 +758,9 @@ class Llava_OneVersion_Qwen(lmms):
                         elif type(visual[0]) == PIL.Image.Image:  # For image, multi-image tasks
                             image_tensor = process_images(visual, self._image_processor, self._config)
                             if type(image_tensor) is list:
-                                image_tensor = [_image.to(dtype=torch.float16, device=self.device) for _image in image_tensor]
+                                image_tensor = [_image.to(dtype=self._model.dtype, device=self.device) for _image in image_tensor]
                             else:
-                                image_tensor = image_tensor.to(dtype=torch.float16, device=self.device)
+                                image_tensor = image_tensor.to(dtype=self._model.dtype, device=self.device)
 
                             task_type = "image"
                             placeholder_count = len(visual) if isinstance(visual, list) else 1

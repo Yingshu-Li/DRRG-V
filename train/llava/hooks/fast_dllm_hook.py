@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import math
 from typing import Optional, Tuple, List, Sequence, Union
 import numpy as np
+from llava.constants import MASK_TOKEN_ID, FORBIDDEN_TOKEN_IDS
 
 class FastDLLMGenerationHook:
     """
@@ -135,7 +136,7 @@ class FastDLLMGenerationHook:
                 query_states,
                 key_states,
                 value_states,
-                attn_mask=None,
+                attn_mask=causal_mask,
                 is_causal=False,
                 dropout_p=attention_layer.attention_dropout if attention_layer.training else 0.0,
             )
@@ -167,25 +168,26 @@ class FastDLLMGenerationHook:
             (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.model.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
         else:
             inputs_embeds = self.model.get_model().embed_tokens(inputs)
-        output = self._fast_generate_with_embeds(inputs_embeds=inputs_embeds, **kwargs)
+        output = self._fast_generate_with_embeds(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **kwargs)
         return output
     
     @torch.no_grad()
     def _fast_generate_with_embeds(
-        self, 
-        inputs_embeds, 
-        steps=128, 
-        gen_length=128, 
-        block_length=128, 
+        self,
+        inputs_embeds,
+        attention_mask=None,
+        steps=128,
+        gen_length=128,
+        block_length=128,
         temperature=0.0,
-        cfg_scale=0.0, 
-        remasking='low_confidence', 
-        mask_id=126336, 
-        tokenizer=None, 
-        stopping_criteria=None, 
-        generation_suffix=None, 
-        threshold=None, 
-        prefix_refresh_interval=32, 
+        cfg_scale=0.0,
+        remasking='low_confidence',
+        mask_id=MASK_TOKEN_ID,
+        tokenizer=None,
+        stopping_criteria=None,
+        generation_suffix=None,
+        threshold=None,
+        prefix_refresh_interval=32,
         **kwargs
     ):
         """
@@ -216,6 +218,14 @@ class FastDLLMGenerationHook:
             x = torch.full((1, total_length), mask_id, dtype=torch.long, device=inputs_embeds.device)
             if suffix_token_ids is not None:
                 x[:, -suffix_len:] = suffix_token_ids
+
+            # Build full attention_mask for the entire sequence (prompt + gen + suffix).
+            # Generation and suffix positions are always attended to (1).
+            # Prompt positions use the provided attention_mask to mask out any padding.
+            full_attention_mask = torch.ones((1, total_length), dtype=torch.long, device=inputs_embeds.device)
+            if attention_mask is not None:
+                prompt_len = inputs_embeds.shape[1]
+                full_attention_mask[:, :prompt_len] = attention_mask[:, :prompt_len]
 
             # Prompt index tracking
             prompt_index = torch.zeros((1, total_length), dtype=torch.bool, device=inputs_embeds.device)
@@ -251,6 +261,7 @@ class FastDLLMGenerationHook:
                 num_transfer_tokens = self._get_num_transfer_tokens(block_mask_index, steps)
                 
                 
+                fast_dllm_cache = []
                 i = 0
 
                 while True:
@@ -275,9 +286,11 @@ class FastDLLMGenerationHook:
                         un_mask = prompt_index.unsqueeze(-1).expand_as(x_embeds)
                         un_embeds[un_mask] = masked_embed.repeat(x_embeds.shape[0], x_embeds.shape[1], 1)[un_mask]
                         combined_embeds = torch.cat([x_embeds, un_embeds], dim=0)
-                        
+                        cfg_attention_mask = full_attention_mask.repeat(2, 1)
+
                         outputs = self.model.model(
                             inputs_embeds=combined_embeds,
+                            attention_mask=cfg_attention_mask,
                             fast_dllm_cache=fast_dllm_cache
                         )
                         logits = self.model.lm_head(outputs[0]).float()
@@ -288,6 +301,7 @@ class FastDLLMGenerationHook:
                             fast_dllm_cache = []
                             outputs = self.model.model(
                                 inputs_embeds=x_embeds,
+                                attention_mask=full_attention_mask,
                                 fast_dllm_cache=fast_dllm_cache
                             )
                             # Slice cache to block start
@@ -301,7 +315,7 @@ class FastDLLMGenerationHook:
                         logits = self.model.lm_head(outputs[0]).float()
 
                     # Filter forbidden tokens
-                    forbidden_tokens = [126081, 126080, 126346, 126347]
+                    forbidden_tokens = FORBIDDEN_TOKEN_IDS
                     if i % prefix_refresh_interval == 0:
                         for token_id in forbidden_tokens:
                             logits[:, :, token_id] = torch.where(mask_index, -float('inf'), logits[:, :, token_id])

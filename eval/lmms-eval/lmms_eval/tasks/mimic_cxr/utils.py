@@ -26,7 +26,7 @@ def clean_text(text: str) -> str:
     text = re.sub(r'---, ---, ---', '', text)
     text = re.sub(r'\(__, __, ___\)', '', text)
     text = re.sub(r'[_-]+', ' ', text)
-    text = re.sub(r'[^\w\s.,:;()\-]', '', text)
+    text = re.sub(r"[^\w\s.,:;()\-/><+']", '', text)
     text = re.sub(r'\s{2,}', ' ', text).strip()
     return text
 

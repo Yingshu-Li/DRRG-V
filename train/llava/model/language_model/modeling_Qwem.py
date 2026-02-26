@@ -54,6 +54,7 @@ except Exception:
 from transformers.utils import auto_docstring, can_return_tuple, logging
 from .configuration_qwen import Qwen3Config
 from llava.cache import dLLMCache, dLLMCacheConfig
+from llava.constants import MASK_TOKEN_ID, FORBIDDEN_TOKEN_IDS
 
 logger = logging.get_logger(__name__)
 
@@ -777,7 +778,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     
     @ torch.no_grad()
     def generate(self, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-                cfg_scale=0., remasking='low_confidence', mask_id=126336):
+                cfg_scale=0., remasking='low_confidence', mask_id=MASK_TOKEN_ID):
         '''
         Args:
             prompt: A tensor of shape (1, l).
@@ -787,7 +788,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             temperature: Categorical distribution sampling temperature.
             cfg_scale: Unsupervised classifier-free guidance scale.
             remasking: Remasking strategy. 'low_confidence' or 'random'.
-            mask_id: The toke id of [MASK] is 126336.
+            mask_id: The token id of [MASK].
         '''
         x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(prompt.device)
         x[:, :prompt.shape[1]] = prompt.clone()
@@ -842,7 +843,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
     @torch.no_grad()
     def generate_with_embeds(self, inputs_embeds, steps=128, gen_length=128, block_length=128, temperature=0.,
-        cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None, use_length_prediction=False, stopping_criteria=None, generation_suffix=None, image_token_mask=None, attention_mask=None, **kwargs):
+        cfg_scale=0., remasking='low_confidence', mask_id=MASK_TOKEN_ID, tokenizer=None, use_length_prediction=False, stopping_criteria=None, generation_suffix=None, image_token_mask=None, attention_mask=None, **kwargs):
         '''
         Args:
             inputs_embeds: A tensor of shape (1, l, d).
@@ -852,7 +853,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             temperature: Categorical distribution sampling temperature.
             cfg_scale: Unsupervised classifier-free guidance scale.
             remasking: Remasking strategy. 'low_confidence' or 'random'.
-            mask_id: The toke id of [MASK] is 126336.
+            mask_id: The token id of [MASK].
             use_length_prediction: Whether to use length prediction head.
             generation_suffix: (str or None) Generation suffix, such as "The answer is xxx", will be appended to the end
         '''
@@ -904,7 +905,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 # Update actual_gen_length (number of masks to keep)
                 actual_gen_length = predicted_eos_idx + 1  # +1 because we include the EOS position
                 
-                print(f"[Length Prediction] Original gen_length: {gen_length}, Predicted EOS at position: {predicted_eos_pos}, Actual gen_length: {actual_gen_length}")
+                logger.info(f"[Length Prediction] Original gen_length: {gen_length}, Predicted EOS at position: {predicted_eos_pos}, Actual gen_length: {actual_gen_length}")
                 gen_length = actual_gen_length       
             # Create input in embedding space
             total_length = inputs_embeds.shape[1] + gen_length + suffix_len
@@ -930,7 +931,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             # and the remaining gen_length+suffix_len elements are 0 (representing the generated part)
             prompt_index = torch.zeros((1, total_length), dtype=torch.bool, device=inputs_embeds.device)
             prompt_index[:, :inputs_embeds.shape[1]] = 1 # shape (1, l + gen_length + suffix_len)
-            block_length = gen_length
             assert gen_length % block_length == 0
             num_blocks = gen_length // block_length
 
@@ -994,7 +994,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         outputs = self.model(inputs_embeds=x_embeds, attention_mask=full_attention_mask)
                         logits = self.lm_head(outputs[0]).float()
                     
-                    for token_id in [126081, 126080, 126346, 126347]:
+                    for token_id in FORBIDDEN_TOKEN_IDS:
                         logits[:, :, token_id] = torch.where(mask_index, -float('inf'), logits[:, :, token_id])
                     
                     # Add noise and get the most likely token
@@ -1132,17 +1132,14 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             # Add label condition filtering
             valid_mask = (labels != -100) # Create valid encoding
             masked_indices = masked_indices & valid_mask # Combine random encoding and valid encoding
-            # Magic number 126336 stands for the tokenizer special token,
-            # Magic embeddings, which is used for [MASK] token here,
-            masked_embed = self.model.embed_tokens(torch.tensor([126336]).to(input_embeds.device))
+            masked_embed = self.model.embed_tokens(torch.tensor([MASK_TOKEN_ID]).to(input_embeds.device))
             noisy_embeds = torch.where(masked_indices.unsqueeze(-1), masked_embed, input_embeds)
 
-            return noisy_embeds, p_mask, masked_embed
+            return noisy_embeds, p_mask, masked_embed, masked_indices
 
         if self.stage in (1, 2):
-            noisy_embeds, p_mask, masked_embed = forward_process_embeds(inputs_embeds, labels)
+            noisy_embeds, p_mask, masked_embed, masked_indices = forward_process_embeds(inputs_embeds, labels)
             bsz, seq_len, _ = inputs_embeds.shape
-            masked_indices = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
             prompt_index = (labels == -100).to(torch.int64)
             target_mask = (1 - prompt_index).bool() # shape (b, l)
             masked_indices_env = (~masked_indices) & (target_mask)
@@ -1156,8 +1153,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             labels =  torch.cat([labels,labels_env])
             noisy_embeds = torch.cat([noisy_embeds,noisy_embeds_inv])
             p_mask_inv = 1.0 - p_mask
+            # Clamp both before concatenation so the complementary pair stays symmetric
+            p_mask = torch.clamp(p_mask, min=1e-3)
+            p_mask_inv = torch.clamp(p_mask_inv, min=1e-3)
             p_mask = torch.cat([p_mask, p_mask_inv], dim=0)
-            p_mask = torch.clamp(p_mask, min=1e-3)  # Numerical stability: prevent near-zero division
             noisy_data_length = noisy_data_length.repeat(2, 1)
             # Double attention_mask for complementary masking (batch is doubled)
             if attention_mask is not None:
@@ -1215,7 +1214,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             if eos_token_id is None:
                 raise ValueError("config.eos_token_id must be set when stage == 3.")
             pad_token_id = getattr(self.config, "pad_token_id", None)
-            mask_id = kwargs.pop("mask_id", 126336)
+            mask_id = kwargs.pop("mask_id", MASK_TOKEN_ID)
             # prompt_index = (labels == -100).to(torch.int64)
             # prompt_embeds = inputs_embeds[:, :prompt_index, :]
             prompt_lens = ((labels == -100) & (attention_mask == 1)).sum(dim=1)
@@ -1262,9 +1261,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             # eos_pos = torch.where(eos_mask, pos_orig, torch.full_like(pos_orig, -1))
             # eos_pos_orig = eos_pos.max(dim=1).values
             if (eos_pos_orig < 0).any():
-                print("No eos_token_id found in input_ids when stage == 3.")
+                logger.warning("No eos_token_id found in input_ids when stage == 3.")
             if (eos_pos_orig >= actual_len).any():
-                print("eos position is outside (prompt_len + length_pred_len) for some samples.")
+                logger.warning("eos position is outside (prompt_len + length_pred_len) for some samples.")
             position_ids_new = torch.arange(max_total_len, device=inputs_embeds.device).unsqueeze(0).expand(bsz, -1)
             mask_start = prompt_lens.unsqueeze(1)
             mask_end   = (prompt_lens + length_pred_len).unsqueeze(1)
@@ -1302,7 +1301,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             loss = None
             if gt is not None:
                 target = gt.argmax(dim=1).long()
-                print(f"Prompt Len: {prompt_lens.tolist()}, GT EOS: {eos_pos_orig.tolist()}, Pred EOS: {scores.argmax(dim=1).tolist()}")
+                logger.info(f"Prompt Len: {prompt_lens.tolist()}, GT EOS: {eos_pos_orig.tolist()}, Pred EOS: {scores.argmax(dim=1).tolist()}")
                 length_loss = F.cross_entropy(scores, target, reduction='mean')    
             # gt_delta = (eos_pos_orig - prompt_lens).float()
             # scores = []

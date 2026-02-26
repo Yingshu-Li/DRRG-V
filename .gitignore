@@ -1,0 +1,43 @@
+# Checkpoints and model weights
+ckpt
+ckpt/
+
+# External dependencies (installed separately)
+dllm
+dllm/
+
+# Data files
+*.json
+train/llada_v_prepare/
+
+# Environment setup
+set_up.sh
+init_env.sh
+pip_constraints_*.txt
+
+# Claude Code
+CLAUDE.md
+
+# Training scripts (machine-specific)
+train/scripts/llada_v_core.sh
+train/scripts/llada_v_length.sh
+
+# NFS temp files
+.nfs*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+wandb/
+runs/
