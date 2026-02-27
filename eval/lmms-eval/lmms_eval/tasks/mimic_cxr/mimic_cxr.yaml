@@ -2,16 +2,16 @@ task: "mimic_cxr"
 test_split: test
 metric_list:
   - metric: rouge_l
-    aggregation: !function utils.mimic_cxr_aggregate_results
+    aggregation: !function utils.mimic_cxr_aggregate_rouge_l
     higher_is_better: true
   - metric: meteor
-    aggregation: !function utils.mimic_cxr_aggregate_results
+    aggregation: !function utils.mimic_cxr_aggregate_meteor
     higher_is_better: true
   - metric: bleu_1
-    aggregation: !function utils.mimic_cxr_aggregate_results
+    aggregation: !function utils.mimic_cxr_aggregate_bleu_1
     higher_is_better: true
   - metric: bleu_4
-    aggregation: !function utils.mimic_cxr_aggregate_results
+    aggregation: !function utils.mimic_cxr_aggregate_bleu_4
     higher_is_better: true
 process_results: !function utils.mimic_cxr_process_results
 lmms_eval_specific_kwargs:

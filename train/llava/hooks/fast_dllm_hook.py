@@ -168,6 +168,12 @@ class FastDLLMGenerationHook:
             (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.model.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
         else:
             inputs_embeds = self.model.get_model().embed_tokens(inputs)
+
+        # Fall back to standard generate_with_embeds for batched inference (bsz > 1),
+        # because the fast dLLM cache is not designed for multi-sample batches.
+        if inputs_embeds.shape[0] > 1:
+            return self.model.generate_with_embeds(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **kwargs)
+
         output = self._fast_generate_with_embeds(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **kwargs)
         return output
     

@@ -14,7 +14,7 @@ import evaluate
 from loguru import logger as eval_logger
 
 # Image folder path for MIMIC-CXR images
-MIMIC_CXR_IMAGE_FOLDER = "/mnt/sda/datasets/mimic_original/2.0.0/files"
+MIMIC_CXR_IMAGE_FOLDER = "/mnt/bn/tns-algo-search-my/Share/phys"
 
 def clean_text(text: str) -> str:
     """
@@ -177,31 +177,27 @@ def mimic_cxr_process_results(doc, results):
     }
 
 
-def mimic_cxr_aggregate_results(results: List[Dict]) -> float:
+def _compute_all_metrics(results: List[Dict]) -> Dict[str, float]:
     """
-    Aggregate results and compute final metrics.
-    
-    Args:
-        results: List of result dictionaries from process_results
-    
-    Returns:
-        Aggregated metric value
+    Shared helper: compute all metrics once and return dict.
+
+    Also saves detailed results to JSON and logs a summary.
     """
     if not results:
-        return 0.0
-    
+        return {"rouge_l": 0.0, "meteor": 0.0, "bleu_1": 0.0, "bleu_4": 0.0}
+
     predictions = [clean_text(r["prediction"]) for r in results]
     references = [clean_text(r["ground_truth"]) for r in results]
-    
+
     # Compute all metrics
     bleu_scores = compute_bleu(predictions, references)
     rouge_scores = compute_rouge(predictions, references)
     meteor = compute_meteor(predictions, references)
-    
+
     # Save detailed results to JSON file
     output_dir = os.environ.get("LMMS_EVAL_OUTPUT_PATH", ".")
     output_file = os.path.join(output_dir, "mimic_cxr_results.json")
-    
+
     detailed_results = {
         "metrics": {
             "bleu_1": bleu_scores['bleu_1'],
@@ -223,7 +219,7 @@ def mimic_cxr_aggregate_results(results: List[Dict]) -> float:
             for r in results
         ]
     }
-    
+
     try:
         os.makedirs(output_dir, exist_ok=True)
         with open(output_file, 'w', encoding='utf-8') as f:
@@ -231,7 +227,7 @@ def mimic_cxr_aggregate_results(results: List[Dict]) -> float:
         eval_logger.info(f"Detailed results saved to: {output_file}")
     except Exception as e:
         eval_logger.warning(f"Failed to save detailed results: {e}")
-    
+
     # Print all metrics
     eval_logger.info("=" * 60)
     eval_logger.info("MIMIC-CXR Report Generation Results:")
@@ -245,7 +241,26 @@ def mimic_cxr_aggregate_results(results: List[Dict]) -> float:
     eval_logger.info(f"  METEOR: {meteor:.4f}")
     eval_logger.info(f"  Samples: {len(predictions)}")
     eval_logger.info("=" * 60)
-    
-    # Return ROUGE-L as the primary metric (this will be called for each metric type)
-    # The framework will use the metric name to determine which value to return
-    return rouge_scores['rouge_l']
+
+    return {
+        "rouge_l": rouge_scores["rouge_l"],
+        "meteor": meteor,
+        "bleu_1": bleu_scores["bleu_1"],
+        "bleu_4": bleu_scores["bleu_4"],
+    }
+
+
+def mimic_cxr_aggregate_rouge_l(results: List[Dict]) -> float:
+    return _compute_all_metrics(results)["rouge_l"]
+
+
+def mimic_cxr_aggregate_meteor(results: List[Dict]) -> float:
+    return _compute_all_metrics(results)["meteor"]
+
+
+def mimic_cxr_aggregate_bleu_1(results: List[Dict]) -> float:
+    return _compute_all_metrics(results)["bleu_1"]
+
+
+def mimic_cxr_aggregate_bleu_4(results: List[Dict]) -> float:
+    return _compute_all_metrics(results)["bleu_4"]

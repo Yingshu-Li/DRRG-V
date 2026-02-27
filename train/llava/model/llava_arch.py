@@ -681,9 +681,9 @@ class LlavaMetaForCausalLM(ABC):
         tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
         # rank_print("Finishing Inserting")
 
-        new_input_embeds = [x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
-        new_labels = [x[:tokenizer_model_max_length] for x, modality in zip(new_labels, modalities)]
-        new_image_masks = [x[:tokenizer_model_max_length] for x, modality in zip(new_image_masks, modalities)]
+        new_input_embeds = [x[:tokenizer_model_max_length] for x in new_input_embeds]
+        new_labels = [x[:tokenizer_model_max_length] for x in new_labels]
+        new_image_masks = [x[:tokenizer_model_max_length] for x in new_image_masks]
         # TODO: Hard code for control loss spike
         # if tokenizer_model_max_length is not None:
         #     new_input_embeds = [x[:4096] if modality != "video" else x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]

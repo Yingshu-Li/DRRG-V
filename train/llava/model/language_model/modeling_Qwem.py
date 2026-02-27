@@ -846,7 +846,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         cfg_scale=0., remasking='low_confidence', mask_id=MASK_TOKEN_ID, tokenizer=None, use_length_prediction=False, stopping_criteria=None, generation_suffix=None, image_token_mask=None, attention_mask=None, **kwargs):
         '''
         Args:
-            inputs_embeds: A tensor of shape (1, l, d).
+            inputs_embeds: A tensor of shape (bsz, l, d).
             steps: Sampling steps, less than or equal to gen_length.
             gen_length: Generated answer length.
             block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
@@ -859,6 +859,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         '''
         # Use mixed precision for faster computation
         with torch.cuda.amp.autocast(enabled=True):
+            bsz = inputs_embeds.shape[0]
+
             # Handle generation suffix
             suffix_embeds = None
             suffix_token_ids = None
@@ -866,30 +868,31 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             if generation_suffix is not None and tokenizer is not None and len(generation_suffix) > 0:
                 # Encode as token id
                 suffix_token_ids = tokenizer.encode(generation_suffix, add_special_tokens=False)
-                suffix_token_ids = torch.tensor(suffix_token_ids, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0)  # (1, s)
+                suffix_token_ids = torch.tensor(suffix_token_ids, dtype=torch.long, device=inputs_embeds.device).unsqueeze(0).expand(bsz, -1)  # (bsz, s)
                 # Convert to embedding
-                suffix_embeds = self.model.embed_tokens(suffix_token_ids)  # (1, s, d)
+                suffix_embeds = self.model.embed_tokens(suffix_token_ids)  # (bsz, s, d)
                 suffix_len = suffix_embeds.shape[1]
             else:
                 suffix_len = 0
             if use_length_prediction and hasattr(self, 'length_discriminator'):
+                assert bsz == 1, "Length prediction is only supported with batch_size=1"
                 # Prepare embeddings for length prediction
                 masked_embed = self.model.embed_tokens(torch.tensor([mask_id], device=inputs_embeds.device))
                 prompt_len = inputs_embeds.shape[1]
-                
+
                 # Create full sequence: prompt + gen_length masks
                 length_pred_embeds = masked_embed.repeat(1, prompt_len + gen_length, 1)
                 length_pred_embeds[:, :prompt_len] = inputs_embeds.clone()
-                
+
                 # Create attention mask for length prediction
                 length_attn_mask = torch.ones((1, prompt_len + gen_length), device=inputs_embeds.device, dtype=torch.long)
-                
+
                 # Forward pass through the model
                 outputs = self.model(
                     inputs_embeds=length_pred_embeds,
                     attention_mask=length_attn_mask,
                     use_cache=False,
-                ) 
+                )
                 hidden_states = outputs.last_hidden_state  # (1, prompt_len + gen_length, hidden_size)
                 # Use the length discriminator network instead of simple linear head
                 eos_scores = self.length_discriminator(hidden_states, attention_mask=length_attn_mask).float()  # (1, prompt_len + gen_length)
@@ -897,50 +900,69 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 mask_region_start = prompt_len
                 mask_region_end = prompt_len + gen_length
                 mask_scores = eos_scores[:, mask_region_start:mask_region_end]  # (1, gen_length)
-            
+
                 # Find the position with highest EOS score in the mask region
                 predicted_eos_idx = torch.argmax(mask_scores, dim=-1).item()  # Relative to mask_region_start
                 predicted_eos_pos = mask_region_start + predicted_eos_idx  # Absolute position
-                
+
                 # Update actual_gen_length (number of masks to keep)
                 actual_gen_length = predicted_eos_idx + 1  # +1 because we include the EOS position
-                
+
                 logger.info(f"[Length Prediction] Original gen_length: {gen_length}, Predicted EOS at position: {predicted_eos_pos}, Actual gen_length: {actual_gen_length}")
-                gen_length = actual_gen_length       
+                gen_length = actual_gen_length
             # Create input in embedding space
             total_length = inputs_embeds.shape[1] + gen_length + suffix_len
             masked_embed = self.model.embed_tokens(torch.tensor([mask_id]).to(inputs_embeds.device)) # shape (1, d)
-            x_embeds = masked_embed.repeat(1, total_length, 1).to(inputs_embeds.device) # shape (1, l + gen_length + suffix_len, d)
+            x_embeds = masked_embed.repeat(bsz, total_length, 1).to(inputs_embeds.device) # shape (bsz, l + gen_length + suffix_len, d)
             x_embeds[:, :inputs_embeds.shape[1]] = inputs_embeds.clone()
             if suffix_embeds is not None:
                 x_embeds[:, -suffix_len:] = suffix_embeds
             # Create a tracking tensor for token IDs for final output
-            x = torch.full((1, total_length), mask_id, dtype=torch.long, device=inputs_embeds.device)
+            x = torch.full((bsz, total_length), mask_id, dtype=torch.long, device=inputs_embeds.device)
             if suffix_token_ids is not None:
                 x[:, -suffix_len:] = suffix_token_ids
 
             # Build full attention_mask for the entire sequence (prompt + gen + suffix).
             # Generation and suffix positions are always attended to (1).
             # Prompt positions use the provided attention_mask to mask out any padding.
-            full_attention_mask = torch.ones((1, total_length), dtype=torch.long, device=inputs_embeds.device)
+            prompt_len_max = inputs_embeds.shape[1]
+            full_attention_mask = torch.ones((bsz, total_length), dtype=torch.long, device=inputs_embeds.device)
             if attention_mask is not None:
-                prompt_len = inputs_embeds.shape[1]
-                full_attention_mask[:, :prompt_len] = attention_mask[:, :prompt_len]
+                full_attention_mask[:, :prompt_len_max] = attention_mask[:, :prompt_len_max]
 
-            # prompt_index: A tensor of shape (1, l + gen_length + suffix_len) where the first l elements are 1 (representing the prompt)
+            # Build per-sample position_ids so generation tokens get correct RoPE
+            # encoding regardless of prompt padding within the batch.
+            # Without this, padded samples would have generation tokens at higher
+            # position IDs than with BS=1, causing different RoPE and degraded output.
+            if attention_mask is not None:
+                actual_prompt_lens = attention_mask[:, :prompt_len_max].sum(dim=1).long()  # (bsz,)
+            else:
+                actual_prompt_lens = torch.full((bsz,), prompt_len_max, dtype=torch.long, device=inputs_embeds.device)
+            position_ids = torch.zeros((bsz, total_length), dtype=torch.long, device=inputs_embeds.device)
+            for b in range(bsz):
+                pl = actual_prompt_lens[b].item()
+                # Assign sequential IDs to attended prompt positions
+                attended = full_attention_mask[b, :prompt_len_max].nonzero(as_tuple=True)[0]
+                position_ids[b, attended] = torch.arange(pl, device=inputs_embeds.device)
+                # Generation + suffix positions continue from actual prompt length
+                gen_suffix_len = gen_length + suffix_len
+                position_ids[b, prompt_len_max:prompt_len_max + gen_suffix_len] = \
+                    torch.arange(pl, pl + gen_suffix_len, device=inputs_embeds.device)
+
+            # prompt_index: A tensor of shape (bsz, l + gen_length + suffix_len) where the first l elements are 1 (representing the prompt)
             # and the remaining gen_length+suffix_len elements are 0 (representing the generated part)
-            prompt_index = torch.zeros((1, total_length), dtype=torch.bool, device=inputs_embeds.device)
-            prompt_index[:, :inputs_embeds.shape[1]] = 1 # shape (1, l + gen_length + suffix_len)
+            prompt_index = torch.zeros((bsz, total_length), dtype=torch.bool, device=inputs_embeds.device)
+            prompt_index[:, :inputs_embeds.shape[1]] = 1 # shape (bsz, l + gen_length + suffix_len)
             assert gen_length % block_length == 0
             num_blocks = gen_length // block_length
 
             assert steps % num_blocks == 0
             steps = steps // num_blocks
 
-            # New: Initialize stop position variable (default to maximum length)
-            stop_position = inputs_embeds.shape[1] + gen_length
-            found_stop_seq = False
-        
+            # Per-sample stop position tracking (default to maximum length)
+            stop_positions = torch.full((bsz,), inputs_embeds.shape[1] + gen_length, dtype=torch.long, device=inputs_embeds.device)
+            found_stop = [False] * bsz
+
             stop_tokens = []
             if stopping_criteria is not None:
                 assert tokenizer is not None, "tokenizer is required when stopping_criteria is not None"
@@ -956,8 +978,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 block_start = inputs_embeds.shape[1] + num_block * block_length
                 block_end = inputs_embeds.shape[1] + (num_block + 1) * block_length
 
-                # If a stop word is found and the stop word position is before the current block, do not process the current block
-                if found_stop_seq and stop_position <= block_start:
+                # If all samples have found stop words before the current block, skip remaining blocks
+                if all(found_stop) and (stop_positions <= block_start).all():
                     break
                 
                 block_embeds = x_embeds[:, block_start:block_end]
@@ -969,21 +991,22 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     # Determine which positions are mask embeddings
                     mask_index = torch.all(torch.abs(x_embeds - masked_embed) < 1e-5, dim=2)
 
-                    # Check if there are any masks left to fill in the current block
-                    current_block_masks = mask_index[0, block_start:block_end]
+                    # Check if there are any masks left to fill in the current block (across all samples)
+                    current_block_masks = mask_index[:, block_start:block_end]
                     if not current_block_masks.any():
                         break
                     
                     # Handle CFG
                     if cfg_scale > 0.:
-                        un_embeds = x_embeds.clone() # shape (1, l + gen_length + suffix_len, d)
-                        un_mask = prompt_index.unsqueeze(-1).expand_as(x_embeds)  # shape (1, l + gen_length + suffix_len, d)
+                        un_embeds = x_embeds.clone() # shape (bsz, l + gen_length + suffix_len, d)
+                        un_mask = prompt_index.unsqueeze(-1).expand_as(x_embeds)  # shape (bsz, l + gen_length + suffix_len, d)
                         un_embeds[un_mask] = masked_embed.repeat(x_embeds.shape[0],x_embeds.shape[1],1)[un_mask] # Use repeat to avoid the complexity of expand_as
                         combined_embeds = torch.cat([x_embeds, un_embeds], dim=0)
                         
-                        # Forward pass (CFG doubles the batch, so double attention_mask too)
+                        # Forward pass (CFG doubles the batch, so double attention_mask and position_ids too)
                         cfg_attn_mask = full_attention_mask.repeat(2, 1)
-                        outputs = self.model(inputs_embeds=combined_embeds, attention_mask=cfg_attn_mask)
+                        cfg_position_ids = position_ids.repeat(2, 1)
+                        outputs = self.model(inputs_embeds=combined_embeds, attention_mask=cfg_attn_mask, position_ids=cfg_position_ids)
                         logits = self.lm_head(outputs[0]).float()
 
                         # Split and apply CFG
@@ -991,21 +1014,21 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                     else:
                         # Forward pass (required every step as x_embeds changes)
-                        outputs = self.model(inputs_embeds=x_embeds, attention_mask=full_attention_mask)
+                        outputs = self.model(inputs_embeds=x_embeds, attention_mask=full_attention_mask, position_ids=position_ids)
                         logits = self.lm_head(outputs[0]).float()
                     
                     for token_id in FORBIDDEN_TOKEN_IDS:
                         logits[:, :, token_id] = torch.where(mask_index, -float('inf'), logits[:, :, token_id])
                     
                     # Add noise and get the most likely token
-                    logits_with_noise = self.add_gumbel_noise(logits, temperature=temperature) # shape (1, l + gen_length + suffix_len, vocab_size)
-                    x0 = torch.argmax(logits_with_noise, dim=-1) # 1, l + gen_length + suffix_len
+                    logits_with_noise = self.add_gumbel_noise(logits, temperature=temperature) # shape (bsz, l + gen_length + suffix_len, vocab_size)
+                    x0 = torch.argmax(logits_with_noise, dim=-1) # bsz, l + gen_length + suffix_len
                     
                     # Get confidence scores
                     if remasking == 'low_confidence':
-                        p = F.softmax(logits.to(torch.float64), dim=-1) # shape (1, l + gen_length + suffix_len, vocab_size)
+                        p = F.softmax(logits.to(torch.float64), dim=-1) # shape (bsz, l + gen_length + suffix_len, vocab_size)
                         x0_p = torch.squeeze(
-                            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # 1, l + gen_length + suffix_len represents the confidence of each x0
+                            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # bsz, l + gen_length + suffix_len represents the confidence of each x0
                     elif remasking == 'random':
                         x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
                     else:
@@ -1019,9 +1042,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                         x0_p[:, -suffix_len:] = -np.inf
 
                     # Update predictions only at mask positions
-                    x0_embeds = self.model.embed_tokens(x0) # shape (1, l + gen_length + suffix_len, d)
+                    x0_embeds = self.model.embed_tokens(x0) # shape (bsz, l + gen_length + suffix_len, d)
                     x0_embeds = torch.where(mask_index.unsqueeze(-1).expand_as(x_embeds), x0_embeds, x_embeds)
-                    x0 = torch.where(mask_index, x0, x) # shape (1, l + gen_length + suffix_len) 
+                    x0 = torch.where(mask_index, x0, x) # shape (bsz, l + gen_length + suffix_len)
                     
                     # Calculate confidence and determine transfer index
                     confidence = torch.where(mask_index, x0_p, -np.inf)
@@ -1037,36 +1060,41 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
             # Check for stop words only on the final result (not during intermediate diffusion steps,
             # because intermediate tokens are unreliable and early EOS detection truncates output)
+            prompt_len = inputs_embeds.shape[1]
             if stopping_criteria is not None:
-                generated_part = x[0, inputs_embeds.shape[1]:inputs_embeds.shape[1]+gen_length]
-                for stop_seq in stop_tokens:
-                    if not isinstance(stop_seq, list):
-                        stop_seq = [stop_seq]
-                    for start_idx in range(generated_part.size(0) - len(stop_seq) + 1):
-                        if torch.all(generated_part[start_idx:start_idx + len(stop_seq)] == torch.tensor(stop_seq, device=x.device)):
-                            current_position = inputs_embeds.shape[1] + start_idx
-                            if not found_stop_seq or current_position < stop_position:
-                                stop_position = current_position
-                                found_stop_seq = True
-                            break
+                for b in range(bsz):
+                    generated_part = x[b, prompt_len:prompt_len + gen_length]
+                    for stop_seq in stop_tokens:
+                        if not isinstance(stop_seq, list):
+                            stop_seq = [stop_seq]
+                        stop_seq_tensor = torch.tensor(stop_seq, device=x.device)
+                        for start_idx in range(generated_part.size(0) - len(stop_seq) + 1):
+                            if torch.all(generated_part[start_idx:start_idx + len(stop_seq)] == stop_seq_tensor):
+                                current_position = prompt_len + start_idx
+                                if not found_stop[b] or current_position < stop_positions[b].item():
+                                    stop_positions[b] = current_position
+                                    found_stop[b] = True
+                                break
 
-            # Return the generated result, up to stop_position, and append the suffix
-            if found_stop_seq:
-                if suffix_len > 0:
-                    return torch.cat([
-                        x[:, inputs_embeds.shape[1]:stop_position], 
-                        x[:, -suffix_len:]
-                    ], dim=1)
-                else:
-                    return x[:, inputs_embeds.shape[1]:stop_position]
+            # Build padded output: each sample may have different effective gen length
+            pad_token_id = kwargs.get("pad_token_id", mask_id)
+            # Compute per-sample gen lengths
+            gen_lens = torch.where(
+                torch.tensor(found_stop, device=x.device),
+                stop_positions - prompt_len,
+                torch.full((bsz,), gen_length, dtype=torch.long, device=x.device),
+            )
+            max_gen = gen_lens.max().item()
+            if suffix_len > 0:
+                result = torch.full((bsz, max_gen + suffix_len), pad_token_id, dtype=torch.long, device=x.device)
             else:
+                result = torch.full((bsz, max_gen), pad_token_id, dtype=torch.long, device=x.device)
+            for b in range(bsz):
+                gl = gen_lens[b].item()
+                result[b, :gl] = x[b, prompt_len:prompt_len + gl]
                 if suffix_len > 0:
-                    return torch.cat([
-                        x[:, inputs_embeds.shape[1]:inputs_embeds.shape[1]+gen_length], 
-                        x[:, -suffix_len:]
-                    ], dim=1)
-                else:
-                    return x[:, inputs_embeds.shape[1]:inputs_embeds.shape[1]+gen_length]
+                    result[b, gl:gl + suffix_len] = x[b, -suffix_len:]
+            return result
     
     @can_return_tuple
     @auto_docstring
@@ -1138,21 +1166,45 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             return noisy_embeds, p_mask, masked_embed, masked_indices
 
         if self.stage in (1, 2):
+            # Identify EOS positions before any modification
+            eos_token_id = getattr(self.config, "eos_token_id", None)
+            eos_positions = (labels == eos_token_id) if eos_token_id is not None else None
+
             noisy_embeds, p_mask, masked_embed, masked_indices = forward_process_embeds(inputs_embeds, labels)
             bsz, seq_len, _ = inputs_embeds.shape
             prompt_index = (labels == -100).to(torch.int64)
             target_mask = (1 - prompt_index).bool() # shape (b, l)
             masked_indices_env = (~masked_indices) & (target_mask)
-            noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
 
+            # Force EOS masked in BOTH views so the model always trains on predicting <|im_end|>
+            if eos_positions is not None and eos_positions.any():
+                masked_indices = masked_indices | eos_positions
+                masked_indices_env = masked_indices_env | eos_positions
+                # Recompute view 1 embeddings with forced EOS mask
+                noisy_embeds = torch.where(masked_indices.unsqueeze(-1), masked_embed, inputs_embeds)
+
+            noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
             noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1]) # shape (b, l)
             noisy_embeds_inv = torch.where(masked_indices_env.view(bsz,seq_len,1),masked_embed,inputs_embeds)
+
             labels_env = labels.clone()
             labels_env[masked_indices]= -100
             labels[masked_indices_env]= -100
+
+            # Restore EOS labels in both views (cross-view ignore would set them to -100)
+            if eos_positions is not None and eos_positions.any():
+                labels[eos_positions] = eos_token_id
+                labels_env[eos_positions] = eos_token_id
+
             labels =  torch.cat([labels,labels_env])
             noisy_embeds = torch.cat([noisy_embeds,noisy_embeds_inv])
             p_mask_inv = 1.0 - p_mask
+
+            # Set p_mask=1.0 at EOS positions (true mask probability is 1.0 since always masked)
+            if eos_positions is not None and eos_positions.any():
+                p_mask = torch.where(eos_positions, torch.ones_like(p_mask), p_mask)
+                p_mask_inv = torch.where(eos_positions, torch.ones_like(p_mask_inv), p_mask_inv)
+
             # Clamp both before concatenation so the complementary pair stays symmetric
             p_mask = torch.clamp(p_mask, min=1e-3)
             p_mask_inv = torch.clamp(p_mask_inv, min=1e-3)

@@ -3,7 +3,7 @@ dataset_name: null
 dataset_kwargs:
   token: True
   data_files:
-    test: /mnt/sdc/shaoyang/LLaDA-V/DRRG/data/test_llava_llada_1.json
+    test: /mnt/bn/tns-algo-search-my/yingshu.li/code/DRRG-V/test_llava_llada.json
 output_type: generate_until
 doc_to_visual: !function utils.mimic_cxr_doc_to_visual
 doc_to_text: !function utils.mimic_cxr_doc_to_text

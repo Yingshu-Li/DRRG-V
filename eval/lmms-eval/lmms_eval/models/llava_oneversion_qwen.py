@@ -183,7 +183,7 @@ class Llava_OneVersion_Qwen(lmms):
         self.conv_template = conv_template
         self.use_cache = use_cache
         self.truncate_context = truncate_context
-        assert self.batch_size_per_gpu == 1, "Llava currently does not support batched generation. See https://github.com/haotian-liu/LLaVA/issues/754. HF Llava also has this issue."
+        # Batched generation is supported for diffusion-based generation (generate_with_embeds)
 
         if accelerator.num_processes > 1:
             assert accelerator.distributed_type in [DistributedType.FSDP, DistributedType.MULTI_GPU, DistributedType.DEEPSPEED], "Unsupported distributed type provided. Only DDP and FSDP are supported."
@@ -473,7 +473,6 @@ class Llava_OneVersion_Qwen(lmms):
             task = batched_task[0]
             split = batched_split[0]
             batched_visuals = [batched_doc_to_visual[0](self.task_dict[task][split][ids]) for ids in batched_doc_id]  # [B, N]
-            assert len(batched_visuals) == 1
 
             # we assume all gen kwargs in the batch are the same
             # this is safe to assume because the `grouper` object ensures it.
@@ -482,7 +481,7 @@ class Llava_OneVersion_Qwen(lmms):
                 gen_kwargs.pop("until")
 
             question_input = []
-            # import ipdb; ipdb.set_trace()
+            image_tensors_list = []  # Collect image tensors from all batch samples
             for visual, context in zip(batched_visuals, batched_contexts):
                 if origin_image_aspect_ratio is not None and self._config.image_aspect_ratio != origin_image_aspect_ratio:
                     self._config.image_aspect_ratio = origin_image_aspect_ratio
@@ -547,10 +546,6 @@ class Llava_OneVersion_Qwen(lmms):
                     3. Image token is not specified in the context and there are image inputs, so we need to add it. In this case, we add the image token at the beginning of the context and add a new line.
                     4. For video tasks, we could add a <image> token or multiple <image> tokens for each frame in the context. This depends on the training strategy and should balance in test to decide which is better
                     """
-                    # if task_type == "image": # indeed in multi-image case, not the video in frames.
-                    #     image_tokens = [DEFAULT_IMAGE_TOKEN] * placeholder_count if isinstance(visual, list) else [DEFAULT_IMAGE_TOKEN]
-                    # elif task_type == "video":
-                    # image_tokens = [DEFAULT_IMAGE_TOKEN] * placeholder_count if self.token_strategy == "multiple" else [DEFAULT_IMAGE_TOKEN]
                     image_tokens = [DEFAULT_IMAGE_TOKEN] * placeholder_count
                     image_tokens = " ".join(image_tokens)
                     question = image_tokens + "\n" + context
@@ -580,7 +575,11 @@ class Llava_OneVersion_Qwen(lmms):
                     conv.append_message(conv.roles[1], None)
                     prompt_question = conv.get_prompt()
                     question_input.append(prompt_question)
-                
+
+                # Collect image tensor for this sample
+                if image_tensor is not None:
+                    image_tensors_list.append(image_tensor)
+
             if "temperature" not in gen_kwargs:
                 gen_kwargs["temperature"] = 0
             if "cfg_scale" not in gen_kwargs:
@@ -602,8 +601,19 @@ class Llava_OneVersion_Qwen(lmms):
             input_ids = self.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_ids).to(self.device)
             attention_masks = input_ids.ne(pad_token_ids).to(self.device)
 
+            # Use collected image tensors list for batched inference; fall back to single tensor for bs=1
+            if len(image_tensors_list) > 1:
+                image_tensor = image_tensors_list
+            elif len(image_tensors_list) == 1:
+                image_tensor = image_tensors_list[0]
+
             if task_type == "image":
-                gen_kwargs["image_sizes"] = [batched_visuals[0][idx].size for idx in range(len(batched_visuals[0]))]
+                # Collect image_sizes from all batch samples
+                image_sizes = []
+                for batch_item in batched_visuals:
+                    for img in batch_item:
+                        image_sizes.append(img.size)
+                gen_kwargs["image_sizes"] = image_sizes
                 stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
                 keywords = [stop_str]
                 if "stopping_criteria" in gen_kwargs:
@@ -642,8 +652,6 @@ class Llava_OneVersion_Qwen(lmms):
 
             text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
             text_outputs = [clean_report_text(output) for output in text_outputs]
-            # Remove trailing period to match reference data format for metric consistency
-            text_outputs = [output[:-1] if output.endswith('.') else output for output in text_outputs]
             num_tokens += (cont != self.tokenizer.eos_token_id).sum()
 
             text_outputs = [response.strip() for response in text_outputs]
